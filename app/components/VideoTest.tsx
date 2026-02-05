@@ -1,12 +1,15 @@
 "use client";
 
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
 
 function VideoTest() {
   const [file, setFile] = useState<File | null>(null);
   const [result, setResult] = useState<any>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [shouldPlay, setShouldPlay] = useState(false);
+  const [showDetections, setShowDetections] = useState(true);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -15,6 +18,135 @@ function VideoTest() {
       setShouldPlay(false);
     }
   };
+
+  // Draw detection boxes on canvas
+  const drawDetections = () => {
+    if (!videoRef.current || !canvasRef.current || !result || !showDetections) return;
+
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Set canvas size to match video
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+
+    // Clear canvas
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Draw object bounding boxes
+    if (result.objects) {
+      result.objects.forEach((object: any) => {
+        if (object.frames && object.frames.length > 0) {
+          // Get the first frame for demonstration
+          const frame = object.frames[0];
+          if (frame.normalizedBoundingBox) {
+            const box = frame.normalizedBoundingBox;
+            const x = box.left || 0;
+            const y = box.top || 0;
+            const width = (box.right || 1) - x;
+            const height = (box.bottom || 1) - y;
+
+            // Draw rectangle
+            ctx.strokeStyle = '#00ff00';
+            ctx.lineWidth = 3;
+            ctx.strokeRect(
+              x * canvas.width,
+              y * canvas.height,
+              width * canvas.width,
+              height * canvas.height
+            );
+
+            // Draw label
+            ctx.fillStyle = '#00ff00';
+            ctx.fillRect(
+              x * canvas.width,
+              y * canvas.height - 25,
+              150,
+              25
+            );
+            ctx.fillStyle = '#000000';
+            ctx.font = '14px Arial';
+            ctx.fillText(
+              `${object.description} (${Math.round(object.confidence * 100)}%)`,
+              x * canvas.width + 5,
+              y * canvas.height - 8
+            );
+          }
+        }
+      });
+    }
+
+    // Draw logo bounding boxes
+    if (result.logos) {
+      result.logos.forEach((logo: any) => {
+        if (logo.tracks && logo.tracks.length > 0) {
+          logo.tracks.forEach((track: any) => {
+            if (track.timestampedObjects && track.timestampedObjects.length > 0) {
+              const obj = track.timestampedObjects[0];
+              if (obj.normalizedBoundingBox) {
+                const box = obj.normalizedBoundingBox;
+                const x = box.left || 0;
+                const y = box.top || 0;
+                const width = (box.right || 1) - x;
+                const height = (box.bottom || 1) - y;
+
+                // Draw rectangle for logo
+                ctx.strokeStyle = '#ffaa00';
+                ctx.lineWidth = 3;
+                ctx.strokeRect(
+                  x * canvas.width,
+                  y * canvas.height,
+                  width * canvas.width,
+                  height * canvas.height
+                );
+
+                // Draw label
+                ctx.fillStyle = '#ffaa00';
+                ctx.fillRect(
+                  x * canvas.width,
+                  y * canvas.height - 25,
+                  150,
+                  25
+                );
+                ctx.fillStyle = '#000000';
+                ctx.font = '14px Arial';
+                ctx.fillText(
+                  `🏢 ${logo.description} (${Math.round(logo.confidence * 100)}%)`,
+                  x * canvas.width + 5,
+                  y * canvas.height - 8
+                );
+              }
+            }
+          });
+        }
+      });
+    }
+  };
+
+  // Update canvas when video plays
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const handleTimeUpdate = () => {
+      drawDetections();
+    };
+
+    video.addEventListener('timeupdate', handleTimeUpdate);
+    
+    return () => {
+      video.removeEventListener('timeupdate', handleTimeUpdate);
+    };
+  }, [result, showDetections]);
+
+  // Initial draw when result is available
+  useEffect(() => {
+    if (result) {
+      drawDetections();
+    }
+  }, [result, showDetections]);
 
   const analyzeVideo = async () => {
     if (!file) return;
@@ -203,20 +335,41 @@ function VideoTest() {
 
           {file && (
             <div className="card border-0 shadow-lg mb-4">
-              <div className="card-header bg-gradient bg-primary text-white">
+              <div className="card-header bg-gradient bg-primary text-white d-flex justify-content-between align-items-center">
                 <h5 className="mb-0">
                   <i className="bi bi-play-fill me-2"></i>Video Preview
                 </h5>
+                <div className="form-check form-switch">
+                  <input 
+                    className="form-check-input" 
+                    type="checkbox" 
+                    id="detectionToggle"
+                    checked={showDetections}
+                    onChange={(e) => setShowDetections(e.target.checked)}
+                  />
+                  <label className="form-check-label text-white" htmlFor="detectionToggle">
+                    Show Detections
+                  </label>
+                </div>
               </div>
               <div className="card-body p-0">
-                <div className="ratio ratio-16x9">
+                <div className="ratio ratio-16x9 position-relative">
                   <video
+                    ref={videoRef}
                     src={URL.createObjectURL(file)}
                     controls
                     autoPlay={shouldPlay}
                     className="w-full h-full"
                     style={{ 
                       boxShadow: '0 10px 30px rgba(0,0,0,0.3)',
+                      borderRadius: '0 0 0.375rem 0.375rem'
+                    }}
+                  />
+                  <canvas
+                    ref={canvasRef}
+                    className="position-absolute top-0 start-0 w-100 h-100"
+                    style={{ 
+                      pointerEvents: 'none',
                       borderRadius: '0 0 0.375rem 0.375rem'
                     }}
                   />
