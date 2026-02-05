@@ -1,31 +1,61 @@
-import { NextResponse } from 'next/server';
+import { NextResponse } from "next/server";
 import {
   VideoIntelligenceServiceClient,
   protos,
-} from '@google-cloud/video-intelligence';
-import { readFileSync } from 'fs';
-import { join } from 'path';
+} from "@google-cloud/video-intelligence";
+import { readFileSync } from "fs";
+import { join } from "path";
 
-// IMPORTANT: Video Intelligence + Buffer require Node.js runtime
-export const runtime = 'nodejs';
+export const runtime = "nodejs";
+
+type NormalizedBox = { left: number; top: number; right: number; bottom: number };
+
+function toSeconds(timeOffset: any): number {
+  const s = Number(timeOffset?.seconds ?? 0);
+  const n = Number(timeOffset?.nanos ?? 0);
+  return s + n / 1e9;
+}
+
+function safeBox(box: any): NormalizedBox | null {
+  if (!box) return null;
+  const left = Number(box.left ?? 0);
+  const top = Number(box.top ?? 0);
+  const right = Number(box.right ?? 0);
+  const bottom = Number(box.bottom ?? 0);
+  return { left, top, right, bottom };
+}
 
 export async function POST(request: Request) {
   try {
+    // ==============================
+    // 1) READ VIDEO FROM REQUEST
+    // ==============================
     const formData = await request.formData();
-    const file = formData.get('video') as File | null;
+    const file = formData.get("video") as File | null;
 
     if (!file) {
       return NextResponse.json(
-        { error: 'No video file provided' },
+        { success: false, error: "No video file provided" },
         { status: 400 }
       );
     }
 
-    // Initialize client with explicit service account credentials
-    const serviceAccountPath = join(process.cwd(), 'app', 'secrets', 'video-sa.json');
-    const serviceAccount = JSON.parse(readFileSync(serviceAccountPath, 'utf8'));
-    
-    const client = new VideoIntelligenceServiceClient({
+    const sizeMB = Math.round((file.size / (1024 * 1024)) * 10) / 10;
+    console.log(`📥 Video received: ${file.name} (${sizeMB} MB)`);
+
+    // ==============================
+    // 2) LOAD SERVICE ACCOUNT (LOCAL)
+    // ==============================
+    const serviceAccountPath = join(
+      process.cwd(),
+      "app",
+      "secrets",
+      "video-sa.json"
+    );
+
+    const serviceAccount = JSON.parse(readFileSync(serviceAccountPath, "utf8"));
+
+    const videoClient = new VideoIntelligenceServiceClient({
       projectId: serviceAccount.project_id,
       credentials: {
         client_email: serviceAccount.client_email,
@@ -33,11 +63,14 @@ export async function POST(request: Request) {
       },
     });
 
-    // Convert uploaded file to Buffer
+    console.log("🔐 Google service account loaded");
+
+    // ==============================
+    // 3) CALL GOOGLE VIDEO API
+    // ==============================
     const inputContent = Buffer.from(await file.arrayBuffer());
 
-    // Call Video Intelligence API
-    const [operation] = await client.annotateVideo({
+    const [operation] = await videoClient.annotateVideo({
       inputContent,
       features: [
         protos.google.cloud.videointelligence.v1.Feature.LABEL_DETECTION,
@@ -46,57 +79,98 @@ export async function POST(request: Request) {
       ],
     });
 
-    // Wait for async processing
+    console.log("🟡 Google API request submitted");
+
     const [operationResult] = await operation.promise();
+    console.log("✅ Google API processing completed");
 
-    const annotationResults = operationResult.annotationResults?.[0];
-    
-    // Get labels
-    const labels = annotationResults?.segmentLabelAnnotations ?? [];
-    
-    // Get objects
-    const objects = annotationResults?.objectAnnotations ?? [];
-    
-    // Get text
-    const textAnnotations = annotationResults?.textAnnotations ?? [];
+    const annotation = operationResult.annotationResults?.[0];
+    if (!annotation) {
+      return NextResponse.json(
+        { success: false, error: "No annotation results returned" },
+        { status: 500 }
+      );
+    }
 
+    // ==============================
+    // 4) EXTRACT + SUMMARIZE (FRONTEND FRIENDLY)
+    // ==============================
+
+    // LABELS (segment labels)
+    const segmentLabels = annotation.segmentLabelAnnotations ?? [];
+    const labels = segmentLabels.map((l: any) => ({
+      description: l.entity?.description ?? "",
+      confidence: Number(l.segments?.[0]?.confidence ?? 0),
+      categories: (l.categoryEntities ?? []).map((c: any) => c.description).filter(Boolean),
+    }));
+
+    // OBJECTS (TRACKING)
+    const objectAnnotations = annotation.objectAnnotations ?? [];
+
+    // Keep objects as a lighter structure:
+    // each object: type + confidence + segment + frames with (t + box)
+    const objects = objectAnnotations.map((obj: any) => {
+      const frames = (obj.frames ?? [])
+        .map((f: any) => {
+          const box = safeBox(f.normalizedBoundingBox);
+          if (!box) return null;
+          return {
+            t: toSeconds(f.timeOffset), // seconds as number (e.g., 26.4)
+            box,
+          };
+        })
+        .filter(Boolean);
+
+      const start = toSeconds(obj.segment?.startTimeOffset);
+      const end = toSeconds(obj.segment?.endTimeOffset);
+
+      return {
+        type: obj.entity?.description ?? "",
+        entityId: obj.entity?.entityId ?? "",
+        confidence: Number(obj.confidence ?? 0),
+        segment: { start, end },
+        frames,
+      };
+    });
+
+    // TEXT
+    const textAnnotations = annotation.textAnnotations ?? [];
+    const text = textAnnotations.map((t: any) => ({
+      text: t.text ?? "",
+      segments: (t.segments ?? []).map((s: any) => ({
+        start: toSeconds(s.startTime),
+        end: toSeconds(s.endTime),
+        confidence: Number(s.confidence ?? 0),
+      })),
+    }));
+
+    console.log(
+      `📊 Extracted → labels=${labels.length}, objects=${objects.length}, text=${text.length}`
+    );
+
+    // OPTIONAL: backend-only raw logging (comment out if too big)
+    // console.log("🔵 RAW GOOGLE RESPONSE:", JSON.stringify(operationResult, null, 2));
+
+    // ==============================
+    // 5) RETURN SUMMARY TO FRONTEND
+    // ==============================
     return NextResponse.json({
-      labels: labels.map((label: any) => ({
-        description: label.entity?.description ?? '',
-        confidence: label.segments?.[0]?.confidence ?? 0,
-        categoryEntities:
-          label.categoryEntities?.map((cat: any) => cat.description) ?? [],
-      })),
-      objects: objects.map((object: any) => ({
-        description: object.entity?.description ?? '',
-        confidence: object.confidence ?? 0,
-        frames: object.frames?.map((frame: any) => ({
-          timeOffset: frame.timeOffset?.seconds ? `${frame.timeOffset.seconds}s` : '0s',
-          normalizedBoundingBox: frame.normalizedBoundingBox
-        })) ?? []
-      })),
-      text: textAnnotations.map((text: any) => ({
-        text: text.text ?? '',
-        segments: text.segments?.map((segment: any) => ({
-          startTime: segment.startTime?.seconds ? `${segment.startTime.seconds}s` : '0s',
-          endTime: segment.endTime?.seconds ? `${segment.endTime.seconds}s` : '0s',
-          confidence: segment.confidence ?? 0
-        })) ?? []
-      }))
+      success: true,
+      filename: file.name,
+      analyzedAt: new Date().toISOString(),
+      summary: {
+        labels,
+        objects,
+        text,
+      },
     });
   } catch (error) {
-    console.error('Error processing video:', error);
-    
-    // Provide more detailed error information
-    let errorMessage = 'Failed to process video';
-    if (error instanceof Error) {
-      errorMessage = `Failed to process video: ${error.message}`;
-    }
-    
+    console.error("❌ Video processing failed:", error);
+
     return NextResponse.json(
-      { 
-        error: errorMessage,
-        details: error instanceof Error ? error.stack : 'Unknown error'
+      {
+        success: false,
+        error: error instanceof Error ? error.message : "Failed to process video",
       },
       { status: 500 }
     );
