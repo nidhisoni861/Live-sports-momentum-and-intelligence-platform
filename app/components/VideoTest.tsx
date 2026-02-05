@@ -6,6 +6,7 @@ function VideoTest() {
   const [file, setFile] = useState<File | null>(null);
   const [result, setResult] = useState<string>('');
   const [isLoading, setIsLoading] = useState(false);
+  const [shouldPlay, setShouldPlay] = useState(false);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -17,6 +18,7 @@ function VideoTest() {
     if (!file) return;
     
     setIsLoading(true);
+    setShouldPlay(true); // Start playing video when analyze is clicked
     setResult('Analyzing video...');
     
     try {
@@ -48,7 +50,12 @@ function VideoTest() {
           `"${textItem.text}" (${Math.round(textItem.segments[0]?.confidence * 100 || 0)}%)`
         ).join(', ') || 'No text detected';
         
-        setResult(`🏷️ **Labels:** ${labels}\n\n🎯 **Objects:** ${objects}\n\n📝 **Text:** ${text}`);
+        // Format logos
+        const logos = data.logos?.map((logo: any) => 
+          `${logo.description} (${Math.round(logo.confidence * 100)}%)`
+        ).join(', ') || 'No logos detected';
+        
+        setResult(`🏷️ **Labels:** ${labels}\n\n🎯 **Objects:** ${objects}\n\n📝 **Text:** ${text}\n\n🏢 **Logos:** ${logos}`);
       }
     } catch (error) {
       console.error('Error analyzing video:', error);
@@ -92,6 +99,7 @@ function VideoTest() {
             <video
               src={URL.createObjectURL(file)}
               controls
+              autoPlay={shouldPlay}
               className="rounded-md w-full"
             />
           </div>
