@@ -1,22 +1,31 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+
+type TimelineEvent = {
+  type: "label" | "object" | "text";
+  name: string;
+  confidence: number;
+  start: number;
+  end: number;
+};
 
 function VideoTest() {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+
   const [file, setFile] = useState<File | null>(null);
-  const [result, setResult] = useState<string>("");
+  const [videoUrl, setVideoUrl] = useState("");
+  const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
+  const [activeEvents, setActiveEvents] = useState<TimelineEvent[]>([]);
   const [isLoading, setIsLoading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(0);
-  const [isProcessing, setIsProcessing] = useState(false);
   const [totalProgress, setTotalProgress] = useState(0);
-  const [videoUrl, setVideoUrl] = useState<string>("");
   const [analysisComplete, setAnalysisComplete] = useState(false);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files?.[0]) {
       setFile(e.target.files[0]);
-      setVideoUrl("");
-      setResult("");
+      setTimeline([]);
+      setActiveEvents([]);
       setAnalysisComplete(false);
     }
   };
@@ -24,224 +33,162 @@ function VideoTest() {
   const analyzeVideo = async () => {
     if (!file) return;
 
-    // Reset states
     setIsLoading(true);
-    setUploadProgress(0);
-    setIsProcessing(false);
     setTotalProgress(0);
-    setVideoUrl("");
-    setResult("");
     setAnalysisComplete(false);
 
-    try {
-      const formData = new FormData();
-      formData.append("video", file);
+    const formData = new FormData();
+    formData.append("video", file);
 
-      // Create upload progress tracking
-      const xhr = new XMLHttpRequest();
-      
-      // Track upload progress
-      xhr.upload.addEventListener('progress', (event) => {
-        if (event.lengthComputable) {
-          const progress = Math.round((event.loaded / event.total) * 100);
-          setUploadProgress(progress);
-          // Update total progress (upload is 30% of total)
-          const total = Math.round(progress * 0.3);
-          setTotalProgress(total);
-          console.log(`Upload progress: ${progress}%, Total: ${total}%`);
-        }
-      });
+    const xhr = new XMLHttpRequest();
 
-      // When upload starts, ensure we show progress
-      xhr.upload.addEventListener('loadstart', () => {
-        setUploadProgress(0);
-        setTotalProgress(0);
-      });
-
-      // When upload is complete, start processing simulation
-      xhr.addEventListener('load', () => {
-        setIsProcessing(true);
-        setUploadProgress(100);
-        // Start simulating API processing progress (70% of total)
-        let processingProgress = 30; // Start from 30% (upload complete)
-        const processingInterval = setInterval(() => {
-          processingProgress += 2; // Increment by 2% every 200ms
-          if (processingProgress <= 100) {
-            setTotalProgress(processingProgress);
-            console.log(`Processing progress: ${processingProgress}%`);
-          } else {
-            clearInterval(processingInterval);
-          }
-        }, 200);
-      });
-
-      // Create promise to handle the request
-      const responsePromise = new Promise((resolve, reject) => {
-        xhr.open('POST', '/api/analyze-video');
-        xhr.onload = () => {
-          if (xhr.status >= 200 && xhr.status < 300) {
-            resolve(JSON.parse(xhr.responseText));
-          } else {
-            reject(new Error(`HTTP error! status: ${xhr.status}`));
-          }
-        };
-        xhr.onerror = () => reject(new Error('Network error'));
-        xhr.send(formData);
-      });
-
-      const data = await responsePromise as any;
-
-      if (!data.success) {
-        setResult(`Error: ${data.error || "Unknown error"}`);
-        return;
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        setTotalProgress(Math.round((e.loaded / e.total) * 30));
       }
+    };
 
-      const summary = data.summary || {};
+    xhr.onload = () => {
+      setTotalProgress(30);
+    };
 
-      // 🏷️ Labels
-      const labels =
-        summary.labels?.length > 0
-          ? summary.labels
-              .map(
-                (label: any) =>
-                  `• ${label.description} (${Math.round(
-                    label.confidence * 100
-                  )}%)`
-              )
-              .join("\n")
-          : "No labels detected";
+    xhr.open("POST", "/api/analyze-video");
+    xhr.send(formData);
 
-      // 🎯 Objects
-      const objects =
-        summary.objects?.length > 0
-          ? summary.objects
-              .map(
-                (obj: any) =>
-                  `• ${obj.type} (${Math.round(
-                    obj.confidence * 100
-                  )}%) [${obj.segment.start}s – ${obj.segment.end}s]`
-              )
-              .join("\n")
-          : "No objects detected";
+    const response = await new Promise<any>((resolve, reject) => {
+      xhr.onload = () => resolve(JSON.parse(xhr.responseText));
+      xhr.onerror = () => reject();
+    });
 
-      // 📝 Text (OCR)
-      const text =
-        summary.text?.length > 0
-          ? summary.text
-              .map(
-                (t: any) =>
-                  `• "${t.text}" (${Math.round(
-                    (t.segments?.[0]?.confidence || 0) * 100
-                  )}%)`
-              )
-              .join("\n")
-          : "No text detected";
-
-      // Set results and make video playable
-      setResult(
-        `🏷️ Labels:\n${labels}\n\n🎯 Objects:\n${objects}\n\n📝 Text:\n${text}`
-      );
-      setVideoUrl(URL.createObjectURL(file));
-      setAnalysisComplete(true);
-      setTotalProgress(100); // Ensure progress reaches 100% when complete
-    } catch (err) {
-      console.error(err);
-      setResult("Error analyzing video. Check console.");
-    } finally {
+    if (!response.success) {
       setIsLoading(false);
-      setIsProcessing(false);
-      setUploadProgress(0);
-      setTotalProgress(0); // Reset total progress
+      return;
     }
+
+    const summary = response.summary || {};
+    const events: TimelineEvent[] = [];
+
+    // 🏷️ Labels
+    summary.labels?.forEach((l: any) => {
+      l.segments?.forEach((s: any) => {
+        events.push({
+          type: "label",
+          name: l.description,
+          confidence: l.confidence,
+          start: s.start,
+          end: s.end,
+        });
+      });
+    });
+
+    // 🎯 Objects
+    summary.objects?.forEach((o: any) => {
+      events.push({
+        type: "object",
+        name: o.type,
+        confidence: o.confidence,
+        start: o.segment.start,
+        end: o.segment.end,
+      });
+    });
+
+    // 📝 Text
+    summary.text?.forEach((t: any) => {
+      t.segments?.forEach((s: any) => {
+        events.push({
+          type: "text",
+          name: t.text,
+          confidence: s.confidence,
+          start: s.start,
+          end: s.end,
+        });
+      });
+    });
+
+    setTimeline(events);
+    setVideoUrl(URL.createObjectURL(file));
+    setTotalProgress(100);
+    setIsLoading(false);
+    setAnalysisComplete(true);
   };
 
-  return (
-    <div className="w-full max-w-2xl p-6 bg-white rounded-lg shadow-md dark:bg-gray-800">
-      <h1 className="text-2xl font-bold mb-6 text-gray-900 dark:text-white">
-        Google Video Intelligence API Test
-      </h1>
+  // 🔥 LIVE VIDEO SYNC
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
 
-      <input
-        type="file"
-        accept="video/*"
-        onChange={handleFileChange}
-        disabled={isLoading}
-        className="block w-full mb-4 text-sm"
-      />
+    const onTimeUpdate = () => {
+      const t = video.currentTime;
+      const active = timeline.filter(
+        (e) => t >= e.start && t <= e.end
+      );
+      setActiveEvents(active);
+    };
+
+    video.addEventListener("timeupdate", onTimeUpdate);
+    return () => video.removeEventListener("timeupdate", onTimeUpdate);
+  }, [timeline]);
+
+  return (
+    <div className="max-w-4xl mx-auto p-6 bg-white dark:bg-gray-900 rounded-lg shadow">
+      <h1 className="text-2xl font-bold mb-4">🎥 Live Video AI Analyzer</h1>
+
+      <input type="file" accept="video/*" onChange={handleFileChange} />
 
       <button
         onClick={analyzeVideo}
         disabled={!file || isLoading}
-        className={`px-4 py-2 rounded-md text-white ${
-          isLoading ? "bg-green-400" : "bg-green-600 hover:bg-green-700"
-        }`}
+        className="mt-4 px-4 py-2 bg-green-600 text-white rounded"
       >
-        {isLoading ? "Processing..." : "Analyze Video"}
+        {isLoading ? "Analyzing..." : "Analyze Video"}
       </button>
 
-      {/* Upload Progress Bar */}
       {isLoading && (
         <div className="mt-4">
-          <div className="text-sm text-gray-600 mb-2">
-            {totalProgress < 30 
-              ? "Uploading video..." 
-              : totalProgress < 100 
-              ? "Processing video with AI..." 
-              : "Analysis complete!"
-            }
-          </div>
-          <div className="w-full bg-gray-200 rounded-full h-2">
-            <div 
-              className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+          <div className="h-2 bg-gray-200 rounded">
+            <div
+              className="h-2 bg-blue-600 rounded"
               style={{ width: `${totalProgress}%` }}
             />
           </div>
-          <div className="text-xs text-gray-500 mt-1">{totalProgress}%</div>
+          <p className="text-xs mt-1">{totalProgress}%</p>
         </div>
       )}
 
-      {/* Processing Loader */}
-      {isProcessing && (
-        <div className="mt-4 flex items-center space-x-2">
-          <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600"></div>
-          <span className="text-sm text-gray-600">Processing video...</span>
-        </div>
-      )}
+      {analysisComplete && (
+        <div className="mt-6 grid grid-cols-3 gap-6">
+          {/* VIDEO */}
+          <div className="col-span-2">
+            <video
+              ref={videoRef}
+              src={videoUrl}
+              controls
+              className="w-full rounded"
+            />
+          </div>
 
-      {/* Video Player - Only show after analysis is complete */}
-      {analysisComplete && videoUrl && (
-        <div className="mt-6">
-          <h3 className="text-lg font-semibold mb-3 text-gray-900 dark:text-white">
-            Video
-          </h3>
-          <video
-            src={videoUrl}
-            controls
-            autoPlay
-            className="w-full rounded-md"
-          />
-        </div>
-      )}
+          {/* LIVE EVENTS */}
+          <div className="bg-gray-100 dark:bg-gray-800 p-4 rounded">
+            <h3 className="font-semibold mb-2">📡 Live Insights</h3>
 
-      {/* Results - Only show after analysis is complete */}
-      {analysisComplete && result && (
-        <div className="mt-6">
-          <h3 className="text-lg font-semibold mb-3 text-gray-900 dark:text-white">
-            Analysis Results
-          </h3>
-          <div className="p-4 bg-gray-100 dark:bg-gray-700 rounded-md">
-            <div className="space-y-4 text-sm">
-              {result.split('\n\n').map((section, index) => (
-                <div key={index}>
-                  <div className="font-semibold text-gray-900 dark:text-white mb-2">
-                    {section.split(':')[0]}
-                  </div>
-                  <div className="text-gray-700 dark:text-gray-300 whitespace-pre-wrap">
-                    {section.split(':')[1]?.trim() || 'No data'}
-                  </div>
+            {activeEvents.length === 0 && (
+              <p className="text-sm text-gray-500">No events right now</p>
+            )}
+
+            {activeEvents.map((e, i) => (
+              <div
+                key={i}
+                className="mb-2 p-2 bg-white dark:bg-gray-700 rounded"
+              >
+                <div className="text-xs uppercase text-gray-500">
+                  {e.type}
                 </div>
-              ))}
-            </div>
+                <div className="font-medium">{e.name}</div>
+                <div className="text-xs">
+                  {(e.confidence * 100).toFixed(0)}%
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       )}
