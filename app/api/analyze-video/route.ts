@@ -6,20 +6,17 @@ import {
 import { readFileSync } from "fs";
 import { join } from "path";
 
-import { saveAnalyzedVideo, getDb, COLLECTIONS } from "@/app/db/models";
+import { saveVideoAnalysis } from "@/app/db/mongo";
+import {
+  buildLiveStateAtTime,
+  getLiveStateAtTime,
+} from "@/app/db/redis-models/live";
 
 export const runtime = "nodejs";
 
-type NormalizedBox = {
-  left: number;
-  top: number;
-  right: number;
-  bottom: number;
-};
-
 const MAX_SIZE_MB = 50;
 
-/* ===== HELPERS ===== */
+/* ================= HELPERS ================= */
 
 function toSeconds(timeOffset: any): number {
   const s = Number(timeOffset?.seconds ?? 0);
@@ -27,34 +24,22 @@ function toSeconds(timeOffset: any): number {
   return s + n / 1e9;
 }
 
-function safeBox(box: any): NormalizedBox | null {
-  if (!box) return null;
-
-  return {
-    left: Number(box.left ?? 0),
-    top: Number(box.top ?? 0),
-    right: Number(box.right ?? 0),
-    bottom: Number(box.bottom ?? 0),
-  };
-}
-
-function validateFile(file: File) {
-  if (!file.type.startsWith("video/")) {
+function validateFile(file: any) {
+  if (!file?.type?.startsWith("video/")) {
     throw new Error("Only video files allowed");
   }
-
   if (file.size > MAX_SIZE_MB * 1024 * 1024) {
     throw new Error(`Max file size is ${MAX_SIZE_MB}MB`);
   }
 }
 
 /* =========================================================
-   POST
+   POST → Upload video → Google analysis → Mongo → Redis init
    ========================================================= */
 export async function POST(request: Request) {
   try {
     const formData = await request.formData();
-    const file = formData.get("video") as File | null;
+    const file = formData.get("video") as any;
 
     if (!file) {
       return NextResponse.json(
@@ -100,15 +85,15 @@ export async function POST(request: Request) {
       throw new Error("No annotation results returned");
     }
 
-    /* ===== Normalize results ===== */
+    /* ===== Normalize results for Mongo ===== */
 
+    // Segment labels (simple)
     const labels = (annotation.segmentLabelAnnotations ?? []).map((l: any) => ({
       name: l.entity?.description ?? "",
       confidence: Number(l.segments?.[0]?.confidence ?? 0),
     }));
 
-    // NOTE: safeBox() exists but we are not storing frames in Mongo now.
-    // If you want frames later, we can add a separate collection for frames.
+    // Object tracking (segment start/end are useful for timeline)
     const objects = (annotation.objectAnnotations ?? []).map((obj: any) => ({
       name: obj.entity?.description ?? "",
       confidence: Number(obj.confidence ?? 0),
@@ -116,24 +101,41 @@ export async function POST(request: Request) {
       end: toSeconds(obj.segment?.endTimeOffset),
     }));
 
-    const text = (annotation.textAnnotations ?? []).map((t: any) => ({
-      text: t.text ?? "",
-      confidence: Number(t.segments?.[0]?.confidence ?? 0),
-      timestamp: toSeconds(t.segments?.[0]?.startTime),
-    }));
+    /**
+     * ✅ OCR FIX FOR TIMELINE:
+     * Flatten *all* segments so each OCR event has real time range.
+     * This enables live.ts to select 0-1 at early t and 0-2 later.
+     */
+    const text = (annotation.textAnnotations ?? []).flatMap((t: any) =>
+      (t.segments ?? []).map((s: any) => ({
+        text: t.text ?? "",
+        confidence: Number(s.confidence ?? 0),
+        start: toSeconds(s.startTime),
+        end: toSeconds(s.endTime),
+        timestamp: toSeconds(s.startTime), // keep for backward compatibility
+      })),
+    );
 
-    /* ===== SAVE TO MONGO (professional multi-collection) ===== */
-
-    await saveAnalyzedVideo({
+    /* ===== SAVE TO MONGO ===== */
+    await saveVideoAnalysis({
       videoId: file.name,
       labels,
       objects,
       text,
+      analyzedAt: new Date(),
     });
+
+    /* ===== Build initial Redis snapshot at t=0 (safe) ===== */
+    try {
+      await buildLiveStateAtTime(file.name, 0);
+    } catch (redisErr) {
+      console.warn("⚠ Redis init failed:", redisErr);
+    }
 
     return NextResponse.json({
       success: true,
       videoId: file.name,
+      message: "Analysis completed",
       summary: {
         labelCount: labels.length,
         objectCount: objects.length,
@@ -151,12 +153,16 @@ export async function POST(request: Request) {
 }
 
 /* =========================================================
-   GET
+   GET → Real Timeline Mode
+   /api/analyze-video?videoId=...&t=37
    ========================================================= */
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
+
     const videoId = searchParams.get("videoId");
+    const tParam = searchParams.get("t");
+    const t = Math.floor(Number(tParam ?? 0));
 
     if (!videoId) {
       return NextResponse.json(
@@ -165,39 +171,29 @@ export async function GET(request: Request) {
       );
     }
 
-    const db = await getDb();
+    const timeSec = Number.isFinite(t) && t >= 0 ? t : 0;
 
-    const analysisArr = await db
-      .collection(COLLECTIONS.ANALYSIS)
-      .find({ videoId })
-      .sort({ analyzedAt: -1 })
-      .limit(1)
-      .toArray();
-
-    if (!analysisArr.length) {
-      return NextResponse.json(
-        { success: false, error: "No analysis found" },
-        { status: 404 },
-      );
+    /* ===== 1) Try Redis first ===== */
+    const cached = await getLiveStateAtTime(videoId, timeSec);
+    if (cached) {
+      return NextResponse.json({
+        success: true,
+        source: "redis",
+        t: timeSec,
+        live: cached,
+      });
     }
 
-    const analysis = analysisArr[0];
-    const analysisId = analysis._id.toString();
+    /* ===== 2) Build snapshot for this time ===== */
+    await buildLiveStateAtTime(videoId, timeSec);
 
-    const [objects, text, labels] = await Promise.all([
-      db.collection(COLLECTIONS.OBJECTS).find({ analysisId }).toArray(),
-      db.collection(COLLECTIONS.OCR).find({ analysisId }).toArray(),
-      db.collection(COLLECTIONS.LABELS).find({ analysisId }).toArray(),
-    ]);
+    const fresh = await getLiveStateAtTime(videoId, timeSec);
 
     return NextResponse.json({
       success: true,
-      data: {
-        analysis,
-        objects,
-        text,
-        labels,
-      },
+      source: "mongo→redis",
+      t: timeSec,
+      live: fresh,
     });
   } catch (error) {
     console.error("❌ Fetch failed:", error);
