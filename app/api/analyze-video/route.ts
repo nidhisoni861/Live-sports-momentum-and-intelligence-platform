@@ -5,10 +5,8 @@ import {
 } from "@google-cloud/video-intelligence";
 import { readFileSync } from "fs";
 import { join } from "path";
-import {
-  saveVideoAnalysis,
-  getVideoAnalysisById,
-} from "@/lib/mongo";
+
+import { saveAnalyzedVideo, getDb, COLLECTIONS } from "@/app/db/models";
 
 export const runtime = "nodejs";
 
@@ -19,6 +17,10 @@ type NormalizedBox = {
   bottom: number;
 };
 
+const MAX_SIZE_MB = 50;
+
+/* ===== HELPERS ===== */
+
 function toSeconds(timeOffset: any): number {
   const s = Number(timeOffset?.seconds ?? 0);
   const n = Number(timeOffset?.nanos ?? 0);
@@ -27,6 +29,7 @@ function toSeconds(timeOffset: any): number {
 
 function safeBox(box: any): NormalizedBox | null {
   if (!box) return null;
+
   return {
     left: Number(box.left ?? 0),
     top: Number(box.top ?? 0),
@@ -35,33 +38,41 @@ function safeBox(box: any): NormalizedBox | null {
   };
 }
 
+function validateFile(file: File) {
+  if (!file.type.startsWith("video/")) {
+    throw new Error("Only video files allowed");
+  }
+
+  if (file.size > MAX_SIZE_MB * 1024 * 1024) {
+    throw new Error(`Max file size is ${MAX_SIZE_MB}MB`);
+  }
+}
+
 /* =========================================================
-   POST → Analyze video + store result in MongoDB
+   POST
    ========================================================= */
 export async function POST(request: Request) {
   try {
-    // 1) Read video
     const formData = await request.formData();
     const file = formData.get("video") as File | null;
 
     if (!file) {
       return NextResponse.json(
         { success: false, error: "No video file provided" },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
-    // 2) Load Google service account
+    validateFile(file);
+
     const serviceAccountPath = join(
       process.cwd(),
       "app",
       "secrets",
-      "video-sa.json"
+      "video-sa.json",
     );
 
-    const serviceAccount = JSON.parse(
-      readFileSync(serviceAccountPath, "utf8")
-    );
+    const serviceAccount = JSON.parse(readFileSync(serviceAccountPath, "utf8"));
 
     const videoClient = new VideoIntelligenceServiceClient({
       projectId: serviceAccount.project_id,
@@ -71,7 +82,6 @@ export async function POST(request: Request) {
       },
     });
 
-    // 3) Call Google Video Intelligence API
     const inputContent = Buffer.from(await file.arrayBuffer());
 
     const [operation] = await videoClient.annotateVideo({
@@ -87,88 +97,61 @@ export async function POST(request: Request) {
     const annotation = operationResult.annotationResults?.[0];
 
     if (!annotation) {
-      return NextResponse.json(
-        { success: false, error: "No annotation results returned" },
-        { status: 500 }
-      );
+      throw new Error("No annotation results returned");
     }
 
-    // 4) Extract labels
-    const labels = (annotation.segmentLabelAnnotations ?? []).map(
-      (l: any) => ({
-        name: l.entity?.description ?? "",
-        confidence: Number(l.segments?.[0]?.confidence ?? 0),
-        categories: (l.categoryEntities ?? [])
-          .map((c: any) => c.description)
-          .filter(Boolean),
-      })
-    );
+    /* ===== Normalize results ===== */
 
-    // 5) Extract objects
-    const objects = (annotation.objectAnnotations ?? []).map((obj: any) => {
-      const frames = (obj.frames ?? [])
-        .map((f: any) => {
-          const box = safeBox(f.normalizedBoundingBox);
-          if (!box) return null;
-          return {
-            t: toSeconds(f.timeOffset),
-            box,
-          };
-        })
-        .filter(Boolean);
-
-      return {
-        type: obj.entity?.description ?? "",
-        confidence: Number(obj.confidence ?? 0),
-        segment: {
-          start: toSeconds(obj.segment?.startTimeOffset),
-          end: toSeconds(obj.segment?.endTimeOffset),
-        },
-        frames,
-      };
-    });
-
-    // 6) Extract text
-    const text = (annotation.textAnnotations ?? []).map((t: any) => ({
-      value: t.text ?? "",
-      segments: (t.segments ?? []).map((s: any) => ({
-        start: toSeconds(s.startTime),
-        end: toSeconds(s.endTime),
-        confidence: Number(s.confidence ?? 0),
-      })),
+    const labels = (annotation.segmentLabelAnnotations ?? []).map((l: any) => ({
+      name: l.entity?.description ?? "",
+      confidence: Number(l.segments?.[0]?.confidence ?? 0),
     }));
 
-    // 7) Save to MongoDB (data access layer)
-    await saveVideoAnalysis({
+    // NOTE: safeBox() exists but we are not storing frames in Mongo now.
+    // If you want frames later, we can add a separate collection for frames.
+    const objects = (annotation.objectAnnotations ?? []).map((obj: any) => ({
+      name: obj.entity?.description ?? "",
+      confidence: Number(obj.confidence ?? 0),
+      start: toSeconds(obj.segment?.startTimeOffset),
+      end: toSeconds(obj.segment?.endTimeOffset),
+    }));
+
+    const text = (annotation.textAnnotations ?? []).map((t: any) => ({
+      text: t.text ?? "",
+      confidence: Number(t.segments?.[0]?.confidence ?? 0),
+      timestamp: toSeconds(t.segments?.[0]?.startTime),
+    }));
+
+    /* ===== SAVE TO MONGO (professional multi-collection) ===== */
+
+    await saveAnalyzedVideo({
       videoId: file.name,
       labels,
       objects,
       text,
-      analyzedAt: new Date(),
     });
 
-    // 8) Return response to frontend
     return NextResponse.json({
       success: true,
       videoId: file.name,
-      analyzedAt: new Date().toISOString(),
-      summary: { labels, objects, text },
-    });
-  } catch (error) {
-    console.error("❌ Video processing failed:", error);
-    return NextResponse.json(
-      {
-        success: false,
-        error:
-          error instanceof Error ? error.message : "Failed to process video",
+      summary: {
+        labelCount: labels.length,
+        objectCount: objects.length,
+        textCount: text.length,
       },
-      { status: 500 }
+    });
+  } catch (error: any) {
+    console.error("❌ Video processing failed:", error);
+
+    return NextResponse.json(
+      { success: false, error: error?.message || "Failed" },
+      { status: 500 },
     );
   }
 }
 
 /* =========================================================
-   GET → Fetch stored analysis from MongoDB
+   GET
    ========================================================= */
 export async function GET(request: Request) {
   try {
@@ -177,29 +160,51 @@ export async function GET(request: Request) {
 
     if (!videoId) {
       return NextResponse.json(
-        { success: false, error: "videoId query param is required" },
-        { status: 400 }
+        { success: false, error: "videoId required" },
+        { status: 400 },
       );
     }
 
-    const data = await getVideoAnalysisById(videoId);
+    const db = await getDb();
 
-    if (!data) {
+    const analysisArr = await db
+      .collection(COLLECTIONS.ANALYSIS)
+      .find({ videoId })
+      .sort({ analyzedAt: -1 })
+      .limit(1)
+      .toArray();
+
+    if (!analysisArr.length) {
       return NextResponse.json(
-        { success: false, error: "No analysis found for this video" },
-        { status: 404 }
+        { success: false, error: "No analysis found" },
+        { status: 404 },
       );
     }
+
+    const analysis = analysisArr[0];
+    const analysisId = analysis._id.toString();
+
+    const [objects, text, labels] = await Promise.all([
+      db.collection(COLLECTIONS.OBJECTS).find({ analysisId }).toArray(),
+      db.collection(COLLECTIONS.OCR).find({ analysisId }).toArray(),
+      db.collection(COLLECTIONS.LABELS).find({ analysisId }).toArray(),
+    ]);
 
     return NextResponse.json({
       success: true,
-      data,
+      data: {
+        analysis,
+        objects,
+        text,
+        labels,
+      },
     });
   } catch (error) {
     console.error("❌ Fetch failed:", error);
+
     return NextResponse.json(
-      { success: false, error: "Failed to fetch video analysis" },
-      { status: 500 }
+      { success: false, error: "Failed to fetch" },
+      { status: 500 },
     );
   }
 }
