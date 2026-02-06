@@ -7,11 +7,9 @@ if (!uri) {
 }
 
 /**
- * We use a global variable to prevent creating
- * multiple MongoDB connections during hot reloads
- * in Next.js (especially in dev mode).
+ * Global cached MongoDB connection
+ * Prevents multiple connections during Next.js hot reloads
  */
-
 let client: MongoClient;
 let clientPromise: Promise<MongoClient>;
 
@@ -26,5 +24,38 @@ if (!global._mongoClientPromise) {
 }
 
 clientPromise = global._mongoClientPromise;
+
+/* =========================================================
+   DATA ACCESS LAYER
+   ========================================================= */
+
+/**
+ * Save video analysis result to MongoDB
+ */
+export async function saveVideoAnalysis(data: {
+  videoId: string;
+  labels: any[];
+  objects: any[];
+  text: any[];
+  analyzedAt?: Date;
+}) {
+  const client = await clientPromise;
+  const db = client.db("video-ai");
+
+  return db.collection("videoAnalysis").insertOne({
+    ...data,
+    createdAt: new Date(),
+  });
+}
+
+/**
+ * Get video analysis by videoId
+ */
+export async function getVideoAnalysisById(videoId: string) {
+  const client = await clientPromise;
+  const db = client.db("video-ai");
+
+  return db.collection("videoAnalysis").findOne({ videoId });
+}
 
 export default clientPromise;
