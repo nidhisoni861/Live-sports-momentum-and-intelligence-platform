@@ -8,7 +8,7 @@ const key = (videoId: string, t: number) =>
 const labelKey = (videoId: string, t: number) =>
   `live:video:${videoId}:t:${Math.floor(t)}:labels`;
 
-const TTL = 360;
+const TTL = 1200;
 
 /* ---------- HELPERS ---------- */
 
