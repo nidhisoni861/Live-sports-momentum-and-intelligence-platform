@@ -1,18 +1,18 @@
+// app/db/mongo.ts
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { MongoClient } from "mongodb";
 
-/* =========================================================
-   CONNECTION SINGLETON (Next.js safe)
-   ========================================================= */
-
 const uri = process.env.MONGODB_URI;
 if (!uri) {
-  throw new Error("MONGODB_URI is not defined");
+  throw new Error("MONGODB_URI is not defined in environment variables");
 }
 
 declare global {
   // eslint-disable-next-line no-var
   var _mongoClientPromise: Promise<MongoClient> | undefined;
+
+  // eslint-disable-next-line no-var
+  var _mongoIndexesReady: Promise<void> | undefined;
 }
 
 if (!global._mongoClientPromise) {
@@ -20,70 +20,71 @@ if (!global._mongoClientPromise) {
   global._mongoClientPromise = client.connect();
 }
 
-const clientPromise = global._mongoClientPromise;
+const clientPromise: Promise<MongoClient> = global._mongoClientPromise!;
+
+export type VideoAnalysisDoc = {
+  videoId: string;
+  labels: any[];
+  objects: any[];
+  text: any[];
+  scoreEvents?: any[];
+  analyzedAt?: Date;
+  createdAt?: Date;
+};
 
 export async function getDb() {
   const client = await clientPromise;
-  return client.db(process.env.MONGODB_DB || "video-ai");
+  const dbName = process.env.MONGODB_DB || "video-ai";
+  return client.db(dbName);
 }
 
-/* =========================================================
-   OPTION A – RAW CLOUD STORAGE (SINGLE DOCUMENT)
-   ========================================================= */
+async function ensureIndexes() {
+  if (!global._mongoIndexesReady) {
+    global._mongoIndexesReady = (async () => {
+      const db = await getDb();
+
+      // ✅ Professional: one doc per videoId
+      await db
+        .collection("videoAnalysis")
+        .createIndex({ videoId: 1 }, { unique: true });
+
+      // ✅ Helpful for sorting / browsing
+      await db.collection("videoAnalysis").createIndex({ createdAt: -1 });
+
+      console.log("🟢 [MONGO] Indexes ensured");
+    })();
+  }
+  await global._mongoIndexesReady;
+}
 
 /**
- * Store the Cloud response EXACTLY as received.
- * No normalization, no flattening.
+ * Upsert by videoId so frontend always reads a single stable record.
+ * Returns the raw update result plus upsertedId (if created).
  */
-export async function saveVideoAnalysis(input: {
-  videoId: string;
-
-  // raw cloud fields
-  filename: string;
-  analyzedAt: Date;
-
-  summary: any;
-  objects: any[];
-  text: any[];
-}) {
+export async function saveVideoAnalysis(data: VideoAnalysisDoc) {
   const db = await getDb();
+  await ensureIndexes();
 
-  await db.collection("videoAnalysisRaw").updateOne(
-    { filename: input.filename },
-    {
-      $set: {
-        filename: input.filename,
-        analyzedAt: input.analyzedAt,
+  const doc = {
+    ...data,
+    createdAt: new Date(),
+    _source: "analyze-video-route",
+  };
 
-        summary: input.summary,
-        objects: input.objects,
-        text: input.text,
+  const result = await db
+    .collection("videoAnalysis")
+    .updateOne({ videoId: data.videoId }, { $set: doc }, { upsert: true });
 
-        updatedAt: new Date(),
-      },
-    },
-    { upsert: true },
-  );
-
-  return { ok: true };
+  return {
+    matchedCount: result.matchedCount,
+    modifiedCount: result.modifiedCount,
+    upsertedId: (result as any).upsertedId?._id ?? null,
+  };
 }
 
-/**
- * Read EXACTLY the same document back.
- */
 export async function getVideoAnalysisById(videoId: string) {
   const db = await getDb();
-
-  const doc = await db
-    .collection("videoAnalysisRaw")
-    .findOne({ filename: videoId });
-
-  if (!doc) return null;
-
-  // return as-is (minus Mongo internal _id)
-  const { _id, ...rest } = doc;
-  return rest;
+  return db.collection("videoAnalysis").findOne({ videoId });
 }
 
-/* compatibility alias */
-export { saveVideoAnalysis as saveAnalyzedVideo };
+export default clientPromise;
