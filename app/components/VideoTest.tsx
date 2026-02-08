@@ -256,44 +256,52 @@ export default function VideoTest() {
     }
 
     // Use data from GET response for mapping
-    const summary = getResponse.summary || {};
+    const analysis = getResponse.analysis || {};
     const events: TimelineEvent[] = [];
 
-    summary.labels?.forEach((l: any) => {
-      l.segments?.forEach((s: any) => {
-        events.push({
-          type: "label",
-          name: l.description,
-          confidence: l.confidence,
-          start: s.start,
-          end: s.end,
-        });
+    // Map labels (they don't have segments in the response, so create full video segment)
+    analysis.labels?.forEach((l: any) => {
+      events.push({
+        type: "label",
+        name: l.name,
+        confidence: l.confidence,
+        start: 0,
+        end: 100, // Use a default duration, will be updated when video loads
       });
     });
 
-    summary.objects?.forEach((o: any) => {
+    // Map objects (they have start/end times)
+    analysis.objects?.forEach((o: any) => {
       events.push({
         type: "object",
-        name: o.type,
+        name: o.name,
         confidence: o.confidence,
-        start: o.segment.start,
-        end: o.segment.end,
+        start: o.start,
+        end: o.end,
       });
     });
 
-    summary.text?.forEach((t: any) => {
-      t.segments?.forEach((s: any) => {
-        events.push({
-          type: "text",
-          name: t.text,
-          confidence: s.confidence,
-          start: s.start,
-          end: s.end,
-        });
+    // Map text (they have start/end times)
+    analysis.text?.forEach((t: any) => {
+      events.push({
+        type: "text",
+        name: t.text,
+        confidence: t.confidence,
+        start: t.start,
+        end: t.end,
       });
     });
 
-    setTrackedObjects(summary.objects ?? []);
+    // Convert objects to trackedObjects format (need to add frames for bounding boxes)
+    const trackedObjectsData: TrackedObject[] = analysis.objects?.map((o: any) => ({
+      type: o.name,
+      entityId: o.name, // Using name as entityId since no specific ID provided
+      confidence: o.confidence,
+      segment: { start: o.start, end: o.end },
+      frames: [], // Empty frames array since no bounding box data provided
+    })) || [];
+
+    setTrackedObjects(trackedObjectsData);
     setTimeline(events);
     setVideoUrl(URL.createObjectURL(file));
     setTotalProgress(100);
