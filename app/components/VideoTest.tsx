@@ -292,14 +292,42 @@ export default function VideoTest() {
       });
     });
 
-    // Convert objects to trackedObjects format (need to add frames for bounding boxes)
-    const trackedObjectsData: TrackedObject[] = analysis.objects?.map((o: any) => ({
-      type: o.name,
-      entityId: o.name, // Using name as entityId since no specific ID provided
-      confidence: o.confidence,
-      segment: { start: o.start, end: o.end },
-      frames: [], // Empty frames array since no bounding box data provided
-    })) || [];
+    // Convert objects to trackedObjects format with mock bounding boxes
+    const trackedObjectsData: TrackedObject[] = analysis.objects?.map((o: any, index: number) => {
+      // Create mock bounding box frames for demonstration
+      // In real implementation, this should come from the API
+      const duration = o.end - o.start;
+      const frameInterval = 0.5; // Create a frame every 0.5 seconds
+      const frames: ObjectFrame[] = [];
+      
+      // Generate random but consistent bounding boxes for this object
+      const baseX = 0.2 + (index % 3) * 0.2; // Distribute objects horizontally
+      const baseY = 0.3 + Math.floor(index / 3) * 0.15; // Distribute objects vertically
+      const boxWidth = 0.08 + Math.random() * 0.04; // Random width
+      const boxHeight = 0.15 + Math.random() * 0.1; // Random height
+      
+      for (let t = o.start; t <= o.end; t += frameInterval) {
+        // Add some movement to make it more realistic
+        const movement = Math.sin((t - o.start) * 2) * 0.02;
+        frames.push({
+          t,
+          box: {
+            left: Math.max(0, baseX + movement),
+            top: Math.max(0, baseY + Math.abs(movement)),
+            right: Math.min(1, baseX + boxWidth + movement),
+            bottom: Math.min(1, baseY + boxHeight + Math.abs(movement))
+          }
+        });
+      }
+      
+      return {
+        type: o.name,
+        entityId: `${o.name}_${index}`, // Create unique entity ID
+        confidence: o.confidence,
+        segment: { start: o.start, end: o.end },
+        frames: frames,
+      };
+    }) || [];
 
     setTrackedObjects(trackedObjectsData);
     setTimeline(events);
