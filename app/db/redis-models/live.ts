@@ -1,5 +1,6 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { getRedis } from "../redis";
-import { getDb, COLLECTIONS } from "../models";
+import clientPromise from "../mongo";
 
 const key = (videoId: string, t: number) =>
   `live:video:${videoId}:t:${Math.floor(t)}`;
@@ -7,54 +8,44 @@ const key = (videoId: string, t: number) =>
 const labelKey = (videoId: string, t: number) =>
   `live:video:${videoId}:t:${Math.floor(t)}:labels`;
 
-const TTL = 360; // short TTL for live timeline
+const TTL = 360;
 
 /* ---------- HELPERS ---------- */
 
-function getRange(e: any): { start: number; end: number } {
+function getRange(e: any) {
   const start = Number(e?.start ?? e?.timestamp ?? 0);
-  const end = Number(e?.end ?? start); // if no end, treat as point
+  const end = Number(e?.end ?? start);
   return { start, end };
 }
 
-function isInWindow(e: any, t: number): boolean {
+function isInWindow(e: any, t: number) {
   const { start, end } = getRange(e);
-  // allow point events (start==end) and ranged events
+
+  // If timestamps are all zero → fallback mode
+  if (start === 0 && end === 0) return true;
+
   return start <= t && (end >= t || end === start);
 }
 
-/**
- * Robust score extraction:
- * - works for: "ARG 0 2 POR", "ARG 0-2 POR", "2 ARG 0 2 POR", "ARG 0 2 PORS"
- * - prefers the two numbers BETWEEN team tokens if present
- */
 function extractScore(text: string): string | null {
   const s = String(text || "")
     .replace(/\s+/g, " ")
     .trim();
 
-  // team-based pattern (best)
   const teamMatch = s.match(
     /(ARG|ESP|POR)\D*(\d{1,2})\D+(\d{1,2})\D*(ARG|ESP|POR)/i,
   );
   if (teamMatch) return `${teamMatch[2]}-${teamMatch[3]}`;
 
-  // generic 0-2 / 0 2 / 0 - 2
   const dashMatch = s.match(/(\d{1,2})\s*[- ]\s*(\d{1,2})/);
   if (dashMatch) return `${dashMatch[1]}-${dashMatch[2]}`;
 
-  // fallback: first two numbers in string
   const nums = s.match(/\d{1,2}/g);
   if (nums && nums.length >= 2) return `${nums[0]}-${nums[1]}`;
 
   return null;
 }
 
-/**
- * Scoreboard candidates:
- * - must contain a team token (ARG/ESP/POR) AND at least two numbers
- * - avoids picking "1st PERIOD" type OCR
- */
 function isScoreboardCandidate(text: string) {
   const s = String(text || "");
   const hasTeam = /(ARG|ESP|POR)/i.test(s);
@@ -62,69 +53,63 @@ function isScoreboardCandidate(text: string) {
   return hasTeam && nums.length >= 2;
 }
 
-/* =========================================================
-   BUILD LIVE STATE AT SPECIFIC TIME
-   ========================================================= */
+/* ========================================================= */
+
 export async function buildLiveStateAtTime(videoId: string, timeSec: number) {
   const t = Math.floor(Number(timeSec) || 0);
 
-  const db = await getDb();
   const redis = await getRedis();
 
-  // Latest analysis doc for this video
-  const analysisArr = await db
-    .collection(COLLECTIONS.ANALYSIS)
+  const client = await clientPromise;
+  const dbName = process.env.MONGODB_DB || "video-ai";
+  const db = client.db(dbName);
+
+  const docArr = await db
+    .collection("videoAnalysis")
     .find({ videoId })
     .sort({ analyzedAt: -1 })
     .limit(1)
     .toArray();
 
-  if (!analysisArr.length) return null;
+  const doc = docArr[0];
+  if (!doc) return null;
 
-  const analysisId = analysisArr[0]._id.toString();
+  const objects = Array.isArray(doc.objects) ? doc.objects : [];
+  const ocr = Array.isArray(doc.text) ? doc.text : [];
+  const labels = Array.isArray(doc.labels) ? doc.labels : [];
 
-  // Pull related docs (do NOT filter by timestamp in query, because older data may have timestamp=0)
-  const [objects, ocr, labels] = await Promise.all([
-    db.collection(COLLECTIONS.OBJECTS).find({ analysisId }).toArray(),
-    db.collection(COLLECTIONS.OCR).find({ analysisId }).toArray(),
-    db.collection(COLLECTIONS.LABELS).find({ analysisId }).toArray(),
-  ]);
-
-  /* ----- PLAYER COUNT (time-aware + cap) ----- */
+  /* ----- PLAYER COUNT ----- */
   const peopleOnScene = objects.filter((o: any) => {
-    if (o?.name !== "person") return false;
+    const name = String(o?.name ?? "")
+      .trim()
+      .toLowerCase();
+    if (name !== "person") return false;
+
+    const conf = Number(o?.confidence ?? 0);
+    if (conf < 0.5) return false;
+
     const { start, end } = getRange(o);
     const dur = Math.max(0, end - start);
-    return dur >= 2 && isInWindow(o, t);
+
+    return dur >= 0.5 && isInWindow(o, t);
   });
 
-  // many "person" tracks include crowd; keep it realistic for futsal
   const playerCount = Math.min(peopleOnScene.length, 14);
 
-  /* ----- SCOREBOARD (time-aware) ----- */
-  const candidates = ocr
-    .filter((ev: any) => isScoreboardCandidate(ev?.text))
-    .filter((ev: any) => isInWindow(ev, t));
+  /* ----- SCOREBOARD FIX ----- */
 
-  // Choose current scoreboard:
-  // 1) latest start time within window
-  // 2) highest confidence
-  // 3) longest end time
-  const best = candidates.sort((a: any, b: any) => {
-    const ra = getRange(a);
-    const rb = getRange(b);
+  const candidates = ocr.filter((ev: any) => isScoreboardCandidate(ev?.text));
 
-    if (rb.start !== ra.start) return rb.start - ra.start;
-    const cb = Number(b?.confidence ?? 0);
-    const ca = Number(a?.confidence ?? 0);
-    if (cb !== ca) return cb - ca;
-    return rb.end - ra.end;
-  })[0];
+  // Sort by confidence first since timestamps unreliable
+  const best = candidates.sort(
+    (a: any, b: any) => Number(b?.confidence ?? 0) - Number(a?.confidence ?? 0),
+  )[0];
 
   const scoreboardText = String(best?.text ?? "");
-  const score = scoreboardText ? (extractScore(scoreboardText) ?? "") : "";
+  const score = extractScore(scoreboardText) ?? "";
 
-  /* ----- WRITE REDIS (atomic-ish) ----- */
+  /* ----- WRITE REDIS ----- */
+
   const k = key(videoId, t);
   const lk = labelKey(videoId, t);
 
@@ -138,6 +123,7 @@ export async function buildLiveStateAtTime(videoId: string, timeSec: number) {
     score,
     lastUpdated: new Date().toISOString(),
   });
+
   pipeline.expire(k, TTL);
 
   pipeline.del(lk);
@@ -152,6 +138,7 @@ export async function buildLiveStateAtTime(videoId: string, timeSec: number) {
       value: String(l?.name ?? ""),
     });
   }
+
   pipeline.expire(lk, TTL);
 
   await pipeline.exec();
@@ -159,13 +146,14 @@ export async function buildLiveStateAtTime(videoId: string, timeSec: number) {
   return { score, scoreboard: scoreboardText };
 }
 
-/* ---------- READ STATE ---------- */
+/* ---------- READ ---------- */
 
 export async function getLiveStateAtTime(videoId: string, timeSec: number) {
   const t = Math.floor(Number(timeSec) || 0);
 
   const redis = await getRedis();
   const data = await redis.hGetAll(key(videoId, t));
+
   if (!data || !data.videoId) return null;
 
   const labels = await redis.zRangeWithScores(labelKey(videoId, t), 0, -1);

@@ -14,9 +14,7 @@ if (!url) {
  */
 
 declare global {
-  // eslint-disable-next-line no-var
   var _redisClient: RedisClientType | undefined;
-  // eslint-disable-next-line no-var
   var _redisClientPromise: Promise<RedisClientType> | undefined;
 }
 
