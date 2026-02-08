@@ -74,7 +74,7 @@ async function ensureIndexes() {
 }
 
 /* ======================================================
-   UPSERT LOGICCC – CREATED AT ONLY ON INSERT
+   UPSERT LOGICCCC – CREATED AT ONLY ON INSERT
    ====================================================== */
 export async function saveVideoAnalysis(data: VideoAnalysisDoc) {
   const db = await getDb();
