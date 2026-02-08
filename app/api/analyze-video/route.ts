@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from "next/server";
 import {
   VideoIntelligenceServiceClient,
@@ -12,15 +13,18 @@ import {
   getLiveStateAtTime,
 } from "@/app/db/redis-models/live";
 
+// 🔥 NEW IMPORT
+import { normalizeToModels } from "@/app/db/models/normalizer";
+
 export const runtime = "nodejs";
 
 const MAX_SIZE_MB = 50;
 
 /* ================= HELPERS ================= */
 
-function toSeconds(timeOffset: any): number {
-  const s = Number(timeOffset?.seconds ?? 0);
-  const n = Number(timeOffset?.nanos ?? 0);
+function toSeconds(d: any): number {
+  const s = Number(d?.seconds ?? 0);
+  const n = Number(d?.nanos ?? 0);
   return s + n / 1e9;
 }
 
@@ -33,8 +37,34 @@ function validateFile(file: any) {
   }
 }
 
+function extractScore(text: string): string | null {
+  const s = String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (/\b\d{1,2}:\d{2}\b/.test(s)) return null;
+
+  const m = s.match(/(\d{1,2})\s*[- ]\s*(\d{1,2})/);
+  return m ? `${m[1]}-${m[2]}` : null;
+}
+
+function getSegStart(seg: any) {
+  return (
+    seg?.segment?.startTimeOffset ??
+    seg?.startTimeOffset ??
+    seg?.startTime ??
+    null
+  );
+}
+
+function getSegEnd(seg: any) {
+  return (
+    seg?.segment?.endTimeOffset ?? seg?.endTimeOffset ?? seg?.endTime ?? null
+  );
+}
+
 /* =========================================================
-   POST → Upload video → Google analysis → Mongo → Redis init
+   POST → Upload video → Google analysis → Mongo → Normalize
    ========================================================= */
 export async function POST(request: Request) {
   try {
@@ -81,19 +111,15 @@ export async function POST(request: Request) {
     const [operationResult] = await operation.promise();
     const annotation = operationResult.annotationResults?.[0];
 
-    if (!annotation) {
-      throw new Error("No annotation results returned");
-    }
+    if (!annotation) throw new Error("No annotation results returned");
 
-    /* ===== Normalize results for Mongo ===== */
+    /* ===== Normalize ===== */
 
-    // Segment labels (simple)
     const labels = (annotation.segmentLabelAnnotations ?? []).map((l: any) => ({
       name: l.entity?.description ?? "",
       confidence: Number(l.segments?.[0]?.confidence ?? 0),
     }));
 
-    // Object tracking (segment start/end are useful for timeline)
     const objects = (annotation.objectAnnotations ?? []).map((obj: any) => ({
       name: obj.entity?.description ?? "",
       confidence: Number(obj.confidence ?? 0),
@@ -101,31 +127,76 @@ export async function POST(request: Request) {
       end: toSeconds(obj.segment?.endTimeOffset),
     }));
 
-    /**
-     * ✅ OCR FIX FOR TIMELINE:
-     * Flatten *all* segments so each OCR event has real time range.
-     * This enables live.ts to select 0-1 at early t and 0-2 later.
-     */
-    const text = (annotation.textAnnotations ?? []).flatMap((t: any) =>
-      (t.segments ?? []).map((s: any) => ({
-        text: t.text ?? "",
-        confidence: Number(s.confidence ?? 0),
-        start: toSeconds(s.startTime),
-        end: toSeconds(s.endTime),
-        timestamp: toSeconds(s.startTime), // keep for backward compatibility
-      })),
-    );
+    const text: any[] = [];
 
-    /* ===== SAVE TO MONGO ===== */
-    await saveVideoAnalysis({
+    for (const ta of annotation.textAnnotations ?? []) {
+      const segs = Array.isArray(ta?.segments) ? ta.segments : [];
+      const frames = Array.isArray(ta?.frames) ? ta.frames : [];
+
+      if (segs.length) {
+        for (const seg of segs) {
+          const startSec = toSeconds(getSegStart(seg));
+          const endSec = toSeconds(getSegEnd(seg));
+
+          text.push({
+            text: ta?.text ?? "",
+            confidence: Number(seg?.confidence ?? 0),
+            start: startSec,
+            end: endSec,
+            timestamp: startSec,
+          });
+        }
+      }
+    }
+
+    const scoreEvents = text
+      .map((ev) => {
+        const score = extractScore(ev.text);
+        return score
+          ? {
+              score,
+              text: ev.text,
+              confidence: ev.confidence,
+              start: ev.start,
+              end: ev.end,
+            }
+          : null;
+      })
+      .filter(Boolean);
+
+    /* ========== 🔥 DIRECT MONGO WRITE ========== */
+
+    console.log("🟣 [ROUTE] Writing to Mongo...");
+
+    const mongoResult = await saveVideoAnalysis({
       videoId: file.name,
       labels,
       objects,
       text,
+      scoreEvents,
       analyzedAt: new Date(),
     });
 
-    /* ===== Build initial Redis snapshot at t=0 (safe) ===== */
+    console.log("🟣 [ROUTE] Mongo stored with ID:", mongoResult.insertedId);
+
+    /* ========== 🔥 NEW: Populate Other Models ========== */
+
+    try {
+      await normalizeToModels({
+        videoId: file.name,
+        labels,
+        objects,
+        text,
+        scoreEvents,
+        analyzedAt: new Date(),
+      });
+
+      console.log("🟢 [ROUTE] Normalized models stored");
+    } catch (normErr) {
+      console.warn("⚠ Normalization failed:", normErr);
+    }
+
+    /* Redis optional */
     try {
       await buildLiveStateAtTime(file.name, 0);
     } catch (redisErr) {
@@ -134,12 +205,14 @@ export async function POST(request: Request) {
 
     return NextResponse.json({
       success: true,
+      mongoId: mongoResult.insertedId,
       videoId: file.name,
-      message: "Analysis completed",
+      storedIn: "mongodb",
       summary: {
         labelCount: labels.length,
         objectCount: objects.length,
         textCount: text.length,
+        scoreEventCount: scoreEvents.length,
       },
     });
   } catch (error: any) {
@@ -147,59 +220,6 @@ export async function POST(request: Request) {
 
     return NextResponse.json(
       { success: false, error: error?.message || "Failed" },
-      { status: 500 },
-    );
-  }
-}
-
-/* =========================================================
-   GET → Real Timeline Mode
-   /api/analyze-video?videoId=...&t=37
-   ========================================================= */
-export async function GET(request: Request) {
-  try {
-    const { searchParams } = new URL(request.url);
-
-    const videoId = searchParams.get("videoId");
-    const tParam = searchParams.get("t");
-    const t = Math.floor(Number(tParam ?? 0));
-
-    if (!videoId) {
-      return NextResponse.json(
-        { success: false, error: "videoId required" },
-        { status: 400 },
-      );
-    }
-
-    const timeSec = Number.isFinite(t) && t >= 0 ? t : 0;
-
-    /* ===== 1) Try Redis first ===== */
-    const cached = await getLiveStateAtTime(videoId, timeSec);
-    if (cached) {
-      return NextResponse.json({
-        success: true,
-        source: "redis",
-        t: timeSec,
-        live: cached,
-      });
-    }
-
-    /* ===== 2) Build snapshot for this time ===== */
-    await buildLiveStateAtTime(videoId, timeSec);
-
-    const fresh = await getLiveStateAtTime(videoId, timeSec);
-
-    return NextResponse.json({
-      success: true,
-      source: "mongo→redis",
-      t: timeSec,
-      live: fresh,
-    });
-  } catch (error) {
-    console.error("❌ Fetch failed:", error);
-
-    return NextResponse.json(
-      { success: false, error: "Failed to fetch" },
       { status: 500 },
     );
   }
