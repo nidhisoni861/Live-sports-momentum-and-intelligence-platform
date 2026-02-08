@@ -187,9 +187,9 @@ export default function VideoTest() {
     xhr.open("POST", "/api/analyze-video");
     xhr.send(formData);
 
-    let response: any;
+    let postResponse: any;
     try {
-      response = await new Promise<any>((resolve, reject) => {
+      postResponse = await new Promise<any>((resolve, reject) => {
         xhr.onload = () => {
           setTotalProgress(60);
           try {
@@ -206,13 +206,57 @@ export default function VideoTest() {
       return;
     }
 
-    if (!response.success) {
-      setErrorMsg(response.error ?? "Analysis failed");
+    if (!postResponse.success) {
+      setErrorMsg(postResponse.error ?? "Analysis failed");
       setIsLoading(false);
       return;
     }
 
-    const summary = response.summary || {};
+    // Extract videoId from POST response
+    const videoId = postResponse.videoId;
+    if (!videoId) {
+      setErrorMsg("No videoId received from server");
+      setIsLoading(false);
+      return;
+    }
+
+    // Make GET request to fetch analysis data using videoId
+    let getResponse: any;
+    try {
+      const getUrl = `/api/analyze-video?videoId=${encodeURIComponent(videoId)}`;
+      const getResponsePromise = fetch(getUrl);
+      
+      // Simulate progress for GET request
+      const progressInterval = setInterval(() => {
+        setTotalProgress(prev => {
+          if (prev < 90) return prev + 2;
+          return prev;
+        });
+      }, 100);
+
+      getResponse = await getResponsePromise;
+      clearInterval(progressInterval);
+      
+      if (!getResponse.ok) {
+        throw new Error(`HTTP error! status: ${getResponse.status}`);
+      }
+      
+      getResponse = await getResponse.json();
+      setTotalProgress(95);
+    } catch (err: any) {
+      setErrorMsg(err.message ?? "Failed to fetch analysis data");
+      setIsLoading(false);
+      return;
+    }
+
+    if (!getResponse.success) {
+      setErrorMsg(getResponse.error ?? "Analysis data fetch failed");
+      setIsLoading(false);
+      return;
+    }
+
+    // Use data from GET response for mapping
+    const summary = getResponse.summary || {};
     const events: TimelineEvent[] = [];
 
     summary.labels?.forEach((l: any) => {
