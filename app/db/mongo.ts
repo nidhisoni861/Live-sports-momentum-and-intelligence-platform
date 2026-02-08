@@ -1,12 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { MongoClient } from "mongodb";
 
-import { Video } from "./models/Video";
-import { Analysis } from "./models/Analysis";
-import { ObjectSegment } from "./models/ObjectSegment";
-import { OcrEvent } from "./models/OcrEvent";
-import { LabelEvent } from "./models/LabelEvent";
-
 /* =========================================================
    CONNECTION SINGLETON (Next.js safe)
    ========================================================= */
@@ -33,157 +27,63 @@ export async function getDb() {
   return client.db(process.env.MONGODB_DB || "video-ai");
 }
 
-/* ========================================================= */
-
-export const COLLECTIONS = {
-  VIDEO: "videos",
-  ANALYSIS: "analyses",
-  OBJECTS: "objectSegments",
-  OCR: "ocrEvents",
-  LABELS: "labelEvents",
-};
-
 /* =========================================================
-   SAVE PIPELINE – FINAL
+   OPTION A – RAW CLOUD STORAGE (SINGLE DOCUMENT)
    ========================================================= */
 
+/**
+ * Store the Cloud response EXACTLY as received.
+ * No normalization, no flattening.
+ */
 export async function saveVideoAnalysis(input: {
   videoId: string;
-  labels: any[];
+
+  // raw cloud fields
+  filename: string;
+  analyzedAt: Date;
+
+  summary: any;
   objects: any[];
   text: any[];
-  scoreEvents?: any[];
-  analyzedAt?: Date;
 }) {
   const db = await getDb();
 
-  /* ----- Video ----- */
-  const video: Video = {
-    videoId: input.videoId,
-    createdAt: new Date(),
-  };
+  await db.collection("videoAnalysisRaw").updateOne(
+    { filename: input.filename },
+    {
+      $set: {
+        filename: input.filename,
+        analyzedAt: input.analyzedAt,
 
-  await db
-    .collection(COLLECTIONS.VIDEO)
-    .updateOne(
-      { videoId: input.videoId },
-      { $setOnInsert: video },
-      { upsert: true },
-    );
+        summary: input.summary,
+        objects: input.objects,
+        text: input.text,
 
-  /* ----- Analysis ----- */
-  const analysis: Analysis = {
-    videoId: input.videoId,
-    summary: {
-      topLabels: input.labels.slice(0, 10),
+        updatedAt: new Date(),
+      },
     },
-    analyzedAt: input.analyzedAt ?? new Date(),
-    createdAt: new Date(),
-  };
+    { upsert: true },
+  );
 
-  const analysisRes = await db
-    .collection(COLLECTIONS.ANALYSIS)
-    .insertOne(analysis);
-
-  const analysisId = analysisRes.insertedId.toString();
-
-  /* ----- Objects (WITH FRAMES) ----- */
-  const objectDocs: ObjectSegment[] = input.objects.map((o: any) => ({
-    videoId: input.videoId,
-    analysisId,
-
-    name: o.type ?? o.name ?? "",
-    entityId: o.entityId ?? null,
-
-    confidence: Number(o?.confidence ?? 0),
-
-    time: {
-      start: Number(o?.segment?.start ?? o?.start ?? 0),
-      end: Number(o?.segment?.end ?? o?.end ?? o?.start ?? 0),
-    },
-
-    frames: Array.isArray(o?.frames)
-      ? o.frames.map((f: any) => ({
-          t: Number(f?.t ?? 0),
-          box: {
-            left: Number(f?.box?.left ?? 0),
-            top: Number(f?.box?.top ?? 0),
-            right: Number(f?.box?.right ?? 0),
-            bottom: Number(f?.box?.bottom ?? 0),
-          },
-        }))
-      : [],
-
-    trackId: o?.trackId?.toString(),
-  }));
-
-  if (objectDocs.length) {
-    await db.collection(COLLECTIONS.OBJECTS).insertMany(objectDocs);
-  }
-
-  /* ----- OCR ----- */
-  const ocrDocs: OcrEvent[] = (input.text ?? []).map((t: any) => ({
-    videoId: input.videoId,
-    analysisId,
-    text: t.text || t,
-    confidence: t.confidence || 0,
-    timestamp: t.timestamp || 0,
-  }));
-
-  if (ocrDocs.length) {
-    await db.collection(COLLECTIONS.OCR).insertMany(ocrDocs);
-  }
-
-  /* ----- Labels ----- */
-  const labelDocs: LabelEvent[] = (input.labels ?? []).map((l: any) => ({
-    videoId: input.videoId,
-    analysisId,
-    name: l.name,
-    confidence: l.confidence,
-  }));
-
-  if (labelDocs.length) {
-    await db.collection(COLLECTIONS.LABELS).insertMany(labelDocs);
-  }
-
-  return {
-    analysisId,
-    insertedObjects: objectDocs.length,
-  };
+  return { ok: true };
 }
 
-/* =========================================================
-   READ HELPER
-   ========================================================= */
-
+/**
+ * Read EXACTLY the same document back.
+ */
 export async function getVideoAnalysisById(videoId: string) {
   const db = await getDb();
 
-  const analysis = await db
-    .collection(COLLECTIONS.ANALYSIS)
-    .findOne({ videoId });
+  const doc = await db
+    .collection("videoAnalysisRaw")
+    .findOne({ filename: videoId });
 
-  if (!analysis) return null;
+  if (!doc) return null;
 
-  const objects = await db
-    .collection(COLLECTIONS.OBJECTS)
-    .find({ videoId })
-    .toArray();
-
-  const labels = await db
-    .collection(COLLECTIONS.LABELS)
-    .find({ videoId })
-    .toArray();
-
-  const ocr = await db.collection(COLLECTIONS.OCR).find({ videoId }).toArray();
-
-  return {
-    ...analysis,
-    objects,
-    labels,
-    ocr,
-  };
+  // return as-is (minus Mongo internal _id)
+  const { _id, ...rest } = doc;
+  return rest;
 }
 
-/* compatibility */
+/* compatibility alias */
 export { saveVideoAnalysis as saveAnalyzedVideo };
