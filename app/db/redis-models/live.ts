@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getRedis } from "../redis";
-import clientPromise from "../mongo";
+import { getDb } from "../mongo";
 
 const key = (videoId: string, t: number) =>
   `live:video:${videoId}:t:${Math.floor(t)}`;
@@ -21,7 +21,6 @@ function getRange(e: any) {
 function isInWindow(e: any, t: number) {
   const { start, end } = getRange(e);
 
-  // If timestamps are all zero → fallback mode
   if (start === 0 && end === 0) return true;
 
   return start <= t && (end >= t || end === start);
@@ -60,9 +59,8 @@ export async function buildLiveStateAtTime(videoId: string, timeSec: number) {
 
   const redis = await getRedis();
 
-  const client = await clientPromise;
-  const dbName = process.env.MONGODB_DB || "video-ai";
-  const db = client.db(dbName);
+  // ✅ FIXED DB ACCESS
+  const db = await getDb();
 
   const docArr = await db
     .collection("videoAnalysis")
@@ -96,11 +94,10 @@ export async function buildLiveStateAtTime(videoId: string, timeSec: number) {
 
   const playerCount = Math.min(peopleOnScene.length, 14);
 
-  /* ----- SCOREBOARD FIX ----- */
+  /* ----- SCOREBOARD ----- */
 
   const candidates = ocr.filter((ev: any) => isScoreboardCandidate(ev?.text));
 
-  // Sort by confidence first since timestamps unreliable
   const best = candidates.sort(
     (a: any, b: any) => Number(b?.confidence ?? 0) - Number(a?.confidence ?? 0),
   )[0];
