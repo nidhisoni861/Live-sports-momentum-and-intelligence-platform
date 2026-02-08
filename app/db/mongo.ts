@@ -1,5 +1,8 @@
 // app/db/mongo.ts
 /* eslint-disable @typescript-eslint/no-explicit-any */
+console.log("Mongo URI:", process.env.MONGODB_URI);
+console.log("Mongo DB:", process.env.MONGODB_DB || "video-ai");
+
 import { MongoClient } from "mongodb";
 
 const uri = process.env.MONGODB_URI;
@@ -10,9 +13,6 @@ if (!uri) {
 declare global {
   // eslint-disable-next-line no-var
   var _mongoClientPromise: Promise<MongoClient> | undefined;
-
-  // eslint-disable-next-line no-var
-  var _mongoIndexesReady: Promise<void> | undefined;
 }
 
 if (!global._mongoClientPromise) {
@@ -38,42 +38,66 @@ export async function getDb() {
   return client.db(dbName);
 }
 
+/* ======================================================
+   SAFE INDEX ENSURE – NO CACHING, NO CRASH ON DUPLICATES
+   ====================================================== */
 async function ensureIndexes() {
-  if (!global._mongoIndexesReady) {
-    global._mongoIndexesReady = (async () => {
-      const db = await getDb();
+  const db = await getDb();
+  const collection = db.collection("videoAnalysis");
 
-      // ✅ Professional: one doc per videoId
-      await db
-        .collection("videoAnalysis")
-        .createIndex({ videoId: 1 }, { unique: true });
+  console.log("==== RUNTIME DB CHECK FROM APP ====");
+  console.log("DB NAME:", db.databaseName);
 
-      // ✅ Helpful for sorting / browsing
-      await db.collection("videoAnalysis").createIndex({ createdAt: -1 });
+  const count = await collection.countDocuments();
+  console.log("DOC COUNT FROM APP:", count);
 
-      console.log("🟢 [MONGO] Indexes ensured");
-    })();
+  const allDocs = await collection.find({}).limit(5).toArray();
+  console.log("SAMPLE DOCS FROM APP:", allDocs);
+
+  try {
+    await collection.createIndex({ videoId: 1 }, { unique: true });
+    await collection.createIndex({ createdAt: -1 });
+
+    console.log("🟢 [MONGO] Indexes ensured (safe)");
+  } catch (err: any) {
+    // DO NOT CRASH ON DUPLICATE OR EXISTING INDEX
+    if (err.code === 11000 || err.codeName === "DuplicateKey") {
+      console.warn(
+        "⚠ Index already exists or previous build conflict – skipping",
+      );
+      return;
+    }
+
+    console.error("❌ Index creation failed:", err);
+    throw err;
   }
-  await global._mongoIndexesReady;
 }
 
-/**
- * Upsert by videoId so frontend always reads a single stable record.
- * Returns the raw update result plus upsertedId (if created).
- */
+/* ======================================================
+   UPSERT LOGIC – CREATED AT ONLY ON INSERT
+   ====================================================== */
 export async function saveVideoAnalysis(data: VideoAnalysisDoc) {
   const db = await getDb();
-  await ensureIndexes();
 
-  const doc = {
-    ...data,
-    createdAt: new Date(),
-    _source: "analyze-video-route",
-  };
+  // ensure indexes but never crash the request
+  await ensureIndexes().catch((e) =>
+    console.warn("Index ensure skipped due to:", e?.message),
+  );
 
-  const result = await db
-    .collection("videoAnalysis")
-    .updateOne({ videoId: data.videoId }, { $set: doc }, { upsert: true });
+  const result = await db.collection("videoAnalysis").updateOne(
+    { videoId: data.videoId },
+    {
+      $set: {
+        ...data,
+        updatedAt: new Date(),
+        _source: "analyze-video-route",
+      },
+      $setOnInsert: {
+        createdAt: new Date(),
+      },
+    },
+    { upsert: true },
+  );
 
   return {
     matchedCount: result.matchedCount,
