@@ -1,4 +1,3 @@
-// app/api/analyze-video/route.ts
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from "next/server";
 import {
@@ -9,17 +8,15 @@ import { readFileSync } from "fs";
 import { join } from "path";
 
 import { saveVideoAnalysis, getVideoAnalysisById } from "@/app/db/mongo";
+import { normalizeToModels } from "@/app/db/models/normalizer";
 import {
   buildLiveStateAtTime,
   getLiveStateAtTime,
 } from "@/app/db/redis-models/live";
-import { normalizeToModels } from "@/app/db/models/normalizer";
 
 export const runtime = "nodejs";
 
 const MAX_SIZE_MB = 50;
-
-/* ================= HELPERS ================= */
 
 function toSeconds(d: any): number {
   const s = Number(d?.seconds ?? 0);
@@ -28,12 +25,11 @@ function toSeconds(d: any): number {
 }
 
 function validateFile(file: any) {
-  if (!file?.type?.startsWith("video/")) {
+  if (!file?.type?.startsWith("video/"))
     throw new Error("Only video files allowed");
-  }
-  if (file.size > MAX_SIZE_MB * 1024 * 1024) {
+
+  if (file.size > MAX_SIZE_MB * 1024 * 1024)
     throw new Error(`Max file size is ${MAX_SIZE_MB}MB`);
-  }
 }
 
 function extractScore(text: string): string | null {
@@ -41,53 +37,33 @@ function extractScore(text: string): string | null {
     .replace(/\s+/g, " ")
     .trim();
 
-  // ignore timestamps like 12:34
   if (/\b\d{1,2}:\d{2}\b/.test(s)) return null;
 
-  // match score patterns like "0-2" or "0 - 2"
   const m = s.match(/(\d{1,2})\s*[- ]\s*(\d{1,2})/);
   return m ? `${m[1]}-${m[2]}` : null;
 }
 
-function getSegStart(seg: any) {
-  return (
-    seg?.segment?.startTimeOffset ??
-    seg?.startTimeOffset ??
-    seg?.startTime ??
-    null
-  );
-}
-
-function getSegEnd(seg: any) {
-  return (
-    seg?.segment?.endTimeOffset ?? seg?.endTimeOffset ?? seg?.endTime ?? null
-  );
-}
-
-/* =========================================================
-   POST → Upload video → Google analysis → Mongo → Normalize
-   ========================================================= */
+/* ================= POST ================= */
 export async function POST(request: Request) {
   try {
     const formData = await request.formData();
     const file = formData.get("video") as any;
 
-    if (!file) {
+    if (!file)
       return NextResponse.json(
         { success: false, error: "No video file provided" },
         { status: 400 },
       );
-    }
 
     validateFile(file);
 
-    // Portable credential path (relative to repo)
     const serviceAccountPath = join(
       process.cwd(),
       "app",
       "secrets",
       "video-sa.json",
     );
+
     const serviceAccount = JSON.parse(readFileSync(serviceAccountPath, "utf8"));
 
     const videoClient = new VideoIntelligenceServiceClient({
@@ -113,38 +89,54 @@ export async function POST(request: Request) {
     const annotation = operationResult.annotationResults?.[0];
     if (!annotation) throw new Error("No annotation results returned");
 
-    /* ===== Normalize (simple) ===== */
-
+    /* ===== LABELS ===== */
     const labels = (annotation.segmentLabelAnnotations ?? []).map((l: any) => ({
       name: l.entity?.description ?? "",
       confidence: Number(l.segments?.[0]?.confidence ?? 0),
     }));
 
+    /* ===== OBJECTS – WITH FRAMES ===== */
     const objects = (annotation.objectAnnotations ?? []).map((obj: any) => ({
       name: obj.entity?.description ?? "",
+      entityId: obj.entity?.entityId ?? null,
+
       confidence: Number(obj.confidence ?? 0),
-      start: toSeconds(obj.segment?.startTimeOffset),
-      end: toSeconds(obj.segment?.endTimeOffset),
+
+      segment: {
+        start: toSeconds(obj.segment?.startTimeOffset),
+        end: toSeconds(obj.segment?.endTimeOffset),
+      },
+
+      frames: Array.isArray(obj.frames)
+        ? obj.frames.map((f: any) => ({
+            t: toSeconds(f.timeOffset),
+            box: {
+              left: Number(f.normalizedBoundingBox?.left ?? 0),
+              top: Number(f.normalizedBoundingBox?.top ?? 0),
+              right: Number(f.normalizedBoundingBox?.right ?? 0),
+              bottom: Number(f.normalizedBoundingBox?.bottom ?? 0),
+            },
+          }))
+        : [],
     }));
 
+    /* ===== TEXT ===== */
     const text: any[] = [];
 
     for (const ta of annotation.textAnnotations ?? []) {
       const segs = Array.isArray(ta?.segments) ? ta.segments : [];
 
-      if (segs.length) {
-        for (const seg of segs) {
-          const startSec = toSeconds(getSegStart(seg));
-          const endSec = toSeconds(getSegEnd(seg));
+      for (const seg of segs) {
+        const startSec = toSeconds(seg?.segment?.startTimeOffset);
+        const endSec = toSeconds(seg?.segment?.endTimeOffset);
 
-          text.push({
-            text: ta?.text ?? "",
-            confidence: Number(seg?.confidence ?? 0),
-            start: startSec,
-            end: endSec,
-            timestamp: startSec,
-          });
-        }
+        text.push({
+          text: ta?.text ?? "",
+          confidence: Number(seg?.confidence ?? 0),
+          start: startSec,
+          end: endSec,
+          timestamp: startSec,
+        });
       }
     }
 
@@ -165,7 +157,7 @@ export async function POST(request: Request) {
 
     const analyzedAt = new Date();
 
-    /* ========== Mongo upsert ========== */
+    /* ===== SAVE TO MONGO ===== */
     const mongoWrite = await saveVideoAnalysis({
       videoId: file.name,
       labels,
@@ -175,10 +167,8 @@ export async function POST(request: Request) {
       analyzedAt,
     });
 
-    // Always return a stable doc to frontend (prevents UI failures)
     const analysis = await getVideoAnalysisById(file.name);
 
-    /* ========== Populate other models (best-effort) ========== */
     try {
       await normalizeToModels({
         videoId: file.name,
@@ -188,35 +178,24 @@ export async function POST(request: Request) {
         scoreEvents,
         analyzedAt,
       });
-    } catch (normErr) {
-      console.warn("⚠ Normalization failed:", normErr);
+    } catch (err) {
+      console.warn("Normalization failed", err);
     }
 
-    /* Redis optional init (best-effort) */
     try {
       await buildLiveStateAtTime(file.name, 0);
-    } catch (redisErr) {
-      console.warn("⚠ Redis init failed:", redisErr);
+    } catch (err) {
+      console.warn("Redis init failed", err);
     }
 
     return NextResponse.json({
       success: true,
       videoId: file.name,
-      mongo: {
-        upsertedId: mongoWrite.upsertedId ?? null,
-        matchedCount: mongoWrite.matchedCount ?? 0,
-        modifiedCount: mongoWrite.modifiedCount ?? 0,
-      },
-      analysis, // full stored doc (frontend can render immediately)
-      summary: {
-        labelCount: labels.length,
-        objectCount: objects.length,
-        textCount: text.length,
-        scoreEventCount: scoreEvents.length,
-      },
+      mongo: mongoWrite,
+      analysis,
     });
   } catch (error: any) {
-    console.error("❌ Video processing failed:", error);
+    console.error(error);
     return NextResponse.json(
       { success: false, error: error?.message || "Failed" },
       { status: 500 },
@@ -224,39 +203,25 @@ export async function POST(request: Request) {
   }
 }
 
-/* =========================================================
-   GET → Fetch stored analysis (Mongo) + live state (Redis)
-   Usage:
-   /api/analyze-video?videoId=football.mp4
-   /api/analyze-video?videoId=football.mp4&t=34
-   ========================================================= */
+/* ================= GET ================= */
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
     const videoId = searchParams.get("videoId");
     const tParam = searchParams.get("t");
-    const t = tParam !== null ? Number(tParam) : null;
 
-    if (!videoId) {
+    if (!videoId)
       return NextResponse.json(
-        { success: false, error: "videoId query param required" },
+        { success: false, error: "videoId required" },
         { status: 400 },
       );
-    }
 
     const analysis = await getVideoAnalysisById(videoId);
 
     const live =
-      t !== null && Number.isFinite(t)
-        ? await getLiveStateAtTime(videoId, t)
+      tParam !== null
+        ? await getLiveStateAtTime(videoId, Number(tParam))
         : null;
-
-    if (!analysis && !live) {
-      return NextResponse.json(
-        { success: false, error: "No data found for videoId" },
-        { status: 404 },
-      );
-    }
 
     return NextResponse.json({
       success: true,
@@ -265,7 +230,6 @@ export async function GET(request: Request) {
       live,
     });
   } catch (error: any) {
-    console.error("❌ GET /api/analyze-video failed:", error);
     return NextResponse.json(
       { success: false, error: error?.message || "Failed" },
       { status: 500 },

@@ -1,18 +1,24 @@
-// app/db/mongo.ts
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { MongoClient } from "mongodb";
 
+import { Video } from "./models/Video";
+import { Analysis } from "./models/Analysis";
+import { ObjectSegment } from "./models/ObjectSegment";
+import { OcrEvent } from "./models/OcrEvent";
+import { LabelEvent } from "./models/LabelEvent";
+
+/* =========================================================
+   CONNECTION SINGLETON (Next.js safe)
+   ========================================================= */
+
 const uri = process.env.MONGODB_URI;
 if (!uri) {
-  throw new Error("MONGODB_URI is not defined in environment variables");
+  throw new Error("MONGODB_URI is not defined");
 }
 
 declare global {
   // eslint-disable-next-line no-var
   var _mongoClientPromise: Promise<MongoClient> | undefined;
-
-  // eslint-disable-next-line no-var
-  var _mongoIndexesReady: Promise<void> | undefined;
 }
 
 if (!global._mongoClientPromise) {
@@ -20,98 +26,164 @@ if (!global._mongoClientPromise) {
   global._mongoClientPromise = client.connect();
 }
 
-const clientPromise: Promise<MongoClient> = global._mongoClientPromise!;
+const clientPromise = global._mongoClientPromise;
 
-export type VideoAnalysisDoc = {
+export async function getDb() {
+  const client = await clientPromise;
+  return client.db(process.env.MONGODB_DB || "video-ai");
+}
+
+/* ========================================================= */
+
+export const COLLECTIONS = {
+  VIDEO: "videos",
+  ANALYSIS: "analyses",
+  OBJECTS: "objectSegments",
+  OCR: "ocrEvents",
+  LABELS: "labelEvents",
+};
+
+/* =========================================================
+   SAVE PIPELINE – FINAL
+   ========================================================= */
+
+export async function saveVideoAnalysis(input: {
   videoId: string;
   labels: any[];
   objects: any[];
   text: any[];
   scoreEvents?: any[];
   analyzedAt?: Date;
-  createdAt?: Date;
-};
+}) {
+  const db = await getDb();
 
-export async function getDb() {
-  const client = await clientPromise;
-  const dbName = process.env.MONGODB_DB || "video-ai";
-  return client.db(dbName);
-}
+  /* ----- Video ----- */
+  const video: Video = {
+    videoId: input.videoId,
+    createdAt: new Date(),
+  };
 
-/**
- * Ensure indexes once per process (hot-reload safe).
- * - Never crashes your API (best-effort)
- * - Handles legacy index-name conflicts
- * - Creates indexes only if missing
- */
-async function ensureIndexes() {
-  if (!global._mongoIndexesReady) {
-    global._mongoIndexesReady = (async () => {
-      const db = await getDb();
-      const col = db.collection("videoAnalysis");
+  await db
+    .collection(COLLECTIONS.VIDEO)
+    .updateOne(
+      { videoId: input.videoId },
+      { $setOnInsert: video },
+      { upsert: true },
+    );
 
-      try {
-        const indexes = await col.indexes();
+  /* ----- Analysis ----- */
+  const analysis: Analysis = {
+    videoId: input.videoId,
+    summary: {
+      topLabels: input.labels.slice(0, 10),
+    },
+    analyzedAt: input.analyzedAt ?? new Date(),
+    createdAt: new Date(),
+  };
 
-        // If old auto-generated index exists but isn't unique, drop it
-        const old = indexes.find((i) => i.name === "videoId_1");
-        if (old && !old.unique) {
-          await col.dropIndex("videoId_1");
-        }
+  const analysisRes = await db
+    .collection(COLLECTIONS.ANALYSIS)
+    .insertOne(analysis);
 
-        // Create unique index only if missing
-        const hasVideoUnique = indexes.some((i) => i.name === "videoId_unique");
-        if (!hasVideoUnique) {
-          await col.createIndex(
-            { videoId: 1 },
-            { unique: true, name: "videoId_unique" },
-          );
-        }
+  const analysisId = analysisRes.insertedId.toString();
 
-        // Create createdAt index only if missing
-        const hasCreatedAt = indexes.some((i) => i.name === "createdAt_desc");
-        if (!hasCreatedAt) {
-          await col.createIndex({ createdAt: -1 }, { name: "createdAt_desc" });
-        }
+  /* ----- Objects (WITH FRAMES) ----- */
+  const objectDocs: ObjectSegment[] = input.objects.map((o: any) => ({
+    videoId: input.videoId,
+    analysisId,
 
-        console.log("🟢 [MONGO] Indexes ensured");
-      } catch (e: any) {
-        // ✅ critical: do not kill POST because of index issues
-        console.warn("⚠ [MONGO] ensureIndexes skipped:", e?.message || e);
-      }
-    })();
+    name: o.type ?? o.name ?? "",
+    entityId: o.entityId ?? null,
+
+    confidence: Number(o?.confidence ?? 0),
+
+    time: {
+      start: Number(o?.segment?.start ?? o?.start ?? 0),
+      end: Number(o?.segment?.end ?? o?.end ?? o?.start ?? 0),
+    },
+
+    frames: Array.isArray(o?.frames)
+      ? o.frames.map((f: any) => ({
+          t: Number(f?.t ?? 0),
+          box: {
+            left: Number(f?.box?.left ?? 0),
+            top: Number(f?.box?.top ?? 0),
+            right: Number(f?.box?.right ?? 0),
+            bottom: Number(f?.box?.bottom ?? 0),
+          },
+        }))
+      : [],
+
+    trackId: o?.trackId?.toString(),
+  }));
+
+  if (objectDocs.length) {
+    await db.collection(COLLECTIONS.OBJECTS).insertMany(objectDocs);
   }
 
-  await global._mongoIndexesReady;
-}
+  /* ----- OCR ----- */
+  const ocrDocs: OcrEvent[] = (input.text ?? []).map((t: any) => ({
+    videoId: input.videoId,
+    analysisId,
+    text: t.text || t,
+    confidence: t.confidence || 0,
+    timestamp: t.timestamp || 0,
+  }));
 
-/**
- * Upsert by videoId so frontend always reads a single stable record.
- */
-export async function saveVideoAnalysis(data: VideoAnalysisDoc) {
-  const db = await getDb();
-  await ensureIndexes();
+  if (ocrDocs.length) {
+    await db.collection(COLLECTIONS.OCR).insertMany(ocrDocs);
+  }
 
-  const doc = {
-    ...data,
-    createdAt: new Date(),
-    _source: "analyze-video-route",
-  };
+  /* ----- Labels ----- */
+  const labelDocs: LabelEvent[] = (input.labels ?? []).map((l: any) => ({
+    videoId: input.videoId,
+    analysisId,
+    name: l.name,
+    confidence: l.confidence,
+  }));
 
-  const result = await db
-    .collection("videoAnalysis")
-    .updateOne({ videoId: data.videoId }, { $set: doc }, { upsert: true });
+  if (labelDocs.length) {
+    await db.collection(COLLECTIONS.LABELS).insertMany(labelDocs);
+  }
 
   return {
-    matchedCount: result.matchedCount,
-    modifiedCount: result.modifiedCount,
-    upsertedId: (result as any).upsertedId?._id ?? null,
+    analysisId,
+    insertedObjects: objectDocs.length,
   };
 }
+
+/* =========================================================
+   READ HELPER
+   ========================================================= */
 
 export async function getVideoAnalysisById(videoId: string) {
   const db = await getDb();
-  return db.collection("videoAnalysis").findOne({ videoId });
+
+  const analysis = await db
+    .collection(COLLECTIONS.ANALYSIS)
+    .findOne({ videoId });
+
+  if (!analysis) return null;
+
+  const objects = await db
+    .collection(COLLECTIONS.OBJECTS)
+    .find({ videoId })
+    .toArray();
+
+  const labels = await db
+    .collection(COLLECTIONS.LABELS)
+    .find({ videoId })
+    .toArray();
+
+  const ocr = await db.collection(COLLECTIONS.OCR).find({ videoId }).toArray();
+
+  return {
+    ...analysis,
+    objects,
+    labels,
+    ocr,
+  };
 }
 
-export default clientPromise;
+/* compatibility */
+export { saveVideoAnalysis as saveAnalyzedVideo };

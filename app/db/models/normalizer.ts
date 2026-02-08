@@ -7,7 +7,7 @@ import type { TimeRange, ParsedScore } from "./types";
  * Explodes the single "videoAnalysis" document into normalized collections:
  * - analyses
  * - labelEvents
- * - objectSegments
+ * - objectSegments   ← NOW WITH FRAMES
  * - ocrEvents
  * - videos
  */
@@ -36,8 +36,6 @@ export async function normalizeToModels(doc: VideoAnalysisDoc) {
 
   /* =========================
      2) labelEvents
-     LabelEvent:
-     { videoId, analysisId?, name, confidence, timeRange? }
      ========================= */
   const labelEvents = (doc.labels ?? []).map((l: any) => ({
     videoId,
@@ -51,20 +49,38 @@ export async function normalizeToModels(doc: VideoAnalysisDoc) {
     await db.collection("labelEvents").insertMany(labelEvents);
   }
 
-  /* =========================
-     3) objectSegments
-     ObjectSegment:
-     { videoId, analysisId?, name, confidence, time: TimeRange, trackId? }
-     ========================= */
+  /* =========================================================
+     3) objectSegments – FULL TRACKING PRESERVED
+     ========================================================= */
   const objectSegments = (doc.objects ?? []).map((o: any) => ({
     videoId,
     analysisId,
-    name: String(o?.name ?? ""),
+
+    // identity
+    name: o.type ?? o.name ?? "",
+    entityId: o.entityId ?? null,
+
     confidence: Number(o?.confidence ?? 0),
+
+    // time range
     time: {
-      start: Number(o?.start ?? 0),
-      end: Number(o?.end ?? o?.start ?? 0),
+      start: Number(o?.segment?.start ?? o?.start ?? 0),
+      end: Number(o?.segment?.end ?? o?.end ?? o?.start ?? 0),
     } as TimeRange,
+
+    // ✅ CRITICAL – FRAME DATA PRESERVED
+    frames: Array.isArray(o?.frames)
+      ? o.frames.map((f: any) => ({
+          t: Number(f?.t ?? 0),
+          box: {
+            left: Number(f?.box?.left ?? 0),
+            top: Number(f?.box?.top ?? 0),
+            right: Number(f?.box?.right ?? 0),
+            bottom: Number(f?.box?.bottom ?? 0),
+          },
+        }))
+      : [],
+
     trackId: o?.trackId != null ? String(o.trackId) : undefined,
   }));
 
@@ -74,8 +90,6 @@ export async function normalizeToModels(doc: VideoAnalysisDoc) {
 
   /* =========================
      4) ocrEvents
-     OcrEvent:
-     { videoId, analysisId?, text, confidence, parsed?, timestamp }
      ========================= */
   const ocrEvents = (doc.text ?? []).map((t: any) => {
     const rawText = String(t?.text ?? "");
@@ -84,6 +98,7 @@ export async function normalizeToModels(doc: VideoAnalysisDoc) {
 
     let parsed: ParsedScore | undefined;
     const m = rawText.match(/(\d{1,2})\s*[- ]\s*(\d{1,2})/);
+
     if (m) {
       parsed = {
         home: Number(m[1]),
