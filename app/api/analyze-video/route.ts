@@ -125,6 +125,15 @@ export async function POST(request: Request) {
       confidence: Number(obj.confidence ?? 0),
       start: toSeconds(obj.segment?.startTimeOffset),
       end: toSeconds(obj.segment?.endTimeOffset),
+      frames: (obj.frames ?? []).map((frame: any) => ({
+        t: toSeconds(frame.timeOffset),
+        box: {
+          left: Number(frame.normalizedBoundingBox?.left ?? 0),
+          top: Number(frame.normalizedBoundingBox?.top ?? 0),
+          right: Number(frame.normalizedBoundingBox?.right ?? 0),
+          bottom: Number(frame.normalizedBoundingBox?.bottom ?? 0),
+        },
+      })),
     }));
 
     const text: any[] = [];
@@ -263,6 +272,12 @@ export async function GET(request: Request) {
       videoId,
       analysis,
       live,
+      summary: analysis ? {
+        labelCount: analysis.labels?.length || 0,
+        objectCount: analysis.objects?.length || 0,
+        textCount: analysis.text?.length || 0,
+        scoreEventCount: analysis.scoreEvents?.length || 0,
+      } : null,
     });
   } catch (error: any) {
     console.error("❌ GET /api/analyze-video failed:", error);

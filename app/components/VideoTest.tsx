@@ -400,7 +400,7 @@ export default function VideoTest() {
       ctx.lineTo(x + w, y + h - cLen);
       ctx.stroke();
 
-      // Foot ellipse
+      // Foot ellipsea
       const cx = x + w / 2;
       const by = y + h;
       const mr = Math.max(w * 0.25, 6);
