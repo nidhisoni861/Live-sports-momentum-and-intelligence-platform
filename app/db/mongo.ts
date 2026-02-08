@@ -38,28 +38,55 @@ export async function getDb() {
   return client.db(dbName);
 }
 
+/**
+ * Ensure indexes once per process (hot-reload safe).
+ * - Never crashes your API (best-effort)
+ * - Handles legacy index-name conflicts
+ * - Creates indexes only if missing
+ */
 async function ensureIndexes() {
   if (!global._mongoIndexesReady) {
     global._mongoIndexesReady = (async () => {
       const db = await getDb();
+      const col = db.collection("videoAnalysis");
 
-      // ✅ Professional: one doc per videoId
-      await db
-        .collection("videoAnalysis")
-        .createIndex({ videoId: 1 }, { unique: true });
+      try {
+        const indexes = await col.indexes();
 
-      // ✅ Helpful for sorting / browsing
-      await db.collection("videoAnalysis").createIndex({ createdAt: -1 });
+        // If old auto-generated index exists but isn't unique, drop it
+        const old = indexes.find((i) => i.name === "videoId_1");
+        if (old && !old.unique) {
+          await col.dropIndex("videoId_1");
+        }
 
-      console.log("🟢 [MONGO] Indexes ensured");
+        // Create unique index only if missing
+        const hasVideoUnique = indexes.some((i) => i.name === "videoId_unique");
+        if (!hasVideoUnique) {
+          await col.createIndex(
+            { videoId: 1 },
+            { unique: true, name: "videoId_unique" },
+          );
+        }
+
+        // Create createdAt index only if missing
+        const hasCreatedAt = indexes.some((i) => i.name === "createdAt_desc");
+        if (!hasCreatedAt) {
+          await col.createIndex({ createdAt: -1 }, { name: "createdAt_desc" });
+        }
+
+        console.log("🟢 [MONGO] Indexes ensured");
+      } catch (e: any) {
+        // ✅ critical: do not kill POST because of index issues
+        console.warn("⚠ [MONGO] ensureIndexes skipped:", e?.message || e);
+      }
     })();
   }
+
   await global._mongoIndexesReady;
 }
 
 /**
  * Upsert by videoId so frontend always reads a single stable record.
- * Returns the raw update result plus upsertedId (if created).
  */
 export async function saveVideoAnalysis(data: VideoAnalysisDoc) {
   const db = await getDb();
