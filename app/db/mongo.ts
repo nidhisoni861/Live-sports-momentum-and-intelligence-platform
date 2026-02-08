@@ -1,3 +1,4 @@
+// app/db/mongo.ts
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { MongoClient } from "mongodb";
 
@@ -6,13 +7,12 @@ if (!uri) {
   throw new Error("MONGODB_URI is not defined in environment variables");
 }
 
-/**
- * Global cached MongoDB connection
- * Prevents multiple connections during Next.js hot reloads
- */
 declare global {
   // eslint-disable-next-line no-var
   var _mongoClientPromise: Promise<MongoClient> | undefined;
+
+  // eslint-disable-next-line no-var
+  var _mongoIndexesReady: Promise<void> | undefined;
 }
 
 if (!global._mongoClientPromise) {
@@ -27,68 +27,59 @@ export type VideoAnalysisDoc = {
   labels: any[];
   objects: any[];
   text: any[];
-  scoreEvents?: any[]; // optional timeline scores
+  scoreEvents?: any[];
   analyzedAt?: Date;
   createdAt?: Date;
 };
 
-/** ✅ Exported so other modules (normalizer) can reuse the same DB connection */
 export async function getDb() {
   const client = await clientPromise;
   const dbName = process.env.MONGODB_DB || "video-ai";
   return client.db(dbName);
 }
 
-// Ensure indexes once per process (hot-reload safe)
-declare global {
-  // eslint-disable-next-line no-var
-  var _mongoIndexesReady: Promise<void> | undefined;
-}
-
 async function ensureIndexes() {
   if (!global._mongoIndexesReady) {
     global._mongoIndexesReady = (async () => {
       const db = await getDb();
-      await db.collection("videoAnalysis").createIndex({ videoId: 1 });
+
+      // ✅ Professional: one doc per videoId
+      await db
+        .collection("videoAnalysis")
+        .createIndex({ videoId: 1 }, { unique: true });
+
+      // ✅ Helpful for sorting / browsing
       await db.collection("videoAnalysis").createIndex({ createdAt: -1 });
+
       console.log("🟢 [MONGO] Indexes ensured");
     })();
   }
   await global._mongoIndexesReady;
 }
 
+/**
+ * Upsert by videoId so frontend always reads a single stable record.
+ * Returns the raw update result plus upsertedId (if created).
+ */
 export async function saveVideoAnalysis(data: VideoAnalysisDoc) {
-  console.log("🟡 [MONGO] saveVideoAnalysis CALLED");
-  console.log("🟡 [MONGO] videoId:", data.videoId);
+  const db = await getDb();
+  await ensureIndexes();
 
-  try {
-    const db = await getDb();
-    const dbName = process.env.MONGODB_DB || "video-ai";
-    console.log("🟡 [MONGO] Using DB:", dbName);
+  const doc = {
+    ...data,
+    createdAt: new Date(),
+    _source: "analyze-video-route",
+  };
 
-    await ensureIndexes();
+  const result = await db
+    .collection("videoAnalysis")
+    .updateOne({ videoId: data.videoId }, { $set: doc }, { upsert: true });
 
-    const doc = {
-      ...data,
-      createdAt: new Date(),
-      _source: "analyze-video-route",
-    };
-
-    const result = await db.collection("videoAnalysis").insertOne(doc);
-
-    console.log("🟢 [MONGO] INSERT SUCCESS:", result.insertedId);
-
-    const check = await db
-      .collection("videoAnalysis")
-      .findOne({ _id: result.insertedId });
-
-    console.log("🟢 [MONGO] VERIFY READ:", check ? "FOUND" : "NOT FOUND");
-
-    return result;
-  } catch (err: any) {
-    console.error("🔴 [MONGO] INSERT FAILED:", err?.message || err);
-    throw err;
-  }
+  return {
+    matchedCount: result.matchedCount,
+    modifiedCount: result.modifiedCount,
+    upsertedId: (result as any).upsertedId?._id ?? null,
+  };
 }
 
 export async function getVideoAnalysisById(videoId: string) {
