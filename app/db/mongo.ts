@@ -43,17 +43,28 @@ async function ensureIndexes() {
     global._mongoIndexesReady = (async () => {
       const db = await getDb();
 
-      // ✅ Professional: one doc per videoId
-      await db
-        .collection("videoAnalysis")
-        .createIndex({ videoId: 1 }, { unique: true });
+      try {
+        // ✅ SAFE + IDEMPOTENT INDEX CREATION
+        await db
+          .collection("videoAnalysis")
+          .createIndex({ videoId: 1 }, { unique: true });
 
-      // ✅ Helpful for sorting / browsing
-      await db.collection("videoAnalysis").createIndex({ createdAt: -1 });
+        await db.collection("videoAnalysis").createIndex({ createdAt: -1 });
 
-      console.log("🟢 [MONGO] Indexes ensured");
+        console.log("🟢 [MONGO] Indexes ensured");
+      } catch (err: any) {
+        // 👉 CRITICAL FIX – don’t crash if index already exists
+        if (err.code === 11000 || err.codeName === "DuplicateKey") {
+          console.log(
+            "⚠ [MONGO] Index already exists / race condition ignored",
+          );
+        } else {
+          throw err;
+        }
+      }
     })();
   }
+
   await global._mongoIndexesReady;
 }
 
