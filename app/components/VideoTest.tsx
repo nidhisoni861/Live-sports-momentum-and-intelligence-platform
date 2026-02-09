@@ -22,6 +22,14 @@ type TimelineEvent = {
   end: number;
 };
 
+type ScoreEvent = {
+  score: string;
+  text: string;
+  confidence: number;
+  start: number;
+  end: number;
+};
+
 type SidebarTab = "objects" | "labels" | "text";
 
 // ===================== Colors =====================
@@ -113,6 +121,8 @@ export default function VideoTest() {
   const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
   const [trackedObjects, setTrackedObjects] = useState<TrackedObject[]>([]);
   const [activeEvents, setActiveEvents] = useState<TimelineEvent[]>([]);
+  const [scoreEvents, setScoreEvents] = useState<ScoreEvent[]>([]);
+  const [activeScoreEvents, setActiveScoreEvents] = useState<ScoreEvent[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [totalProgress, setTotalProgress] = useState(0);
   const [analysisComplete, setAnalysisComplete] = useState(false);
@@ -144,6 +154,8 @@ export default function VideoTest() {
     setFile(f);
     setTimeline([]);
     setActiveEvents([]);
+    setScoreEvents([]);
+    setActiveScoreEvents([]);
     setTrackedObjects([]);
     setAnalysisComplete(false);
     setLiveStats({});
@@ -292,6 +304,15 @@ export default function VideoTest() {
       });
     });
 
+    // Map score events
+    const scoreEventsData: ScoreEvent[] = analysis.scoreEvents?.map((s: any) => ({
+      score: s.score,
+      text: s.text,
+      confidence: s.confidence,
+      start: s.start,
+      end: s.end,
+    })) || [];
+
     // Convert objects to trackedObjects format using real frame data from API
     const trackedObjectsData: TrackedObject[] = analysis.objects?.map((o: any, index: number) => {
       return {
@@ -303,6 +324,7 @@ export default function VideoTest() {
       };
     }) || [];
 
+    setScoreEvents(scoreEventsData);
     setTrackedObjects(trackedObjectsData);
     setTimeline(events);
     setVideoUrl(URL.createObjectURL(file));
@@ -481,10 +503,11 @@ export default function VideoTest() {
     const onTimeUpdate = () => {
       const t = video.currentTime;
       setActiveEvents(timeline.filter((e) => t >= e.start && t <= e.end));
+      setActiveScoreEvents(scoreEvents.filter((e) => t >= e.start && t <= e.end));
     };
     video.addEventListener("timeupdate", onTimeUpdate);
     return () => video.removeEventListener("timeupdate", onTimeUpdate);
-  }, [timeline]);
+  }, [timeline, scoreEvents]);
 
   // ---- Resize observer ----
   useEffect(() => {
@@ -715,6 +738,64 @@ export default function VideoTest() {
               />
             </div>
 
+            {/* Score Events Box */}
+            <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4">
+              <h3 className="text-sm font-semibold text-white mb-3 flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-orange-500" />
+                Score Updates
+              </h3>
+              {activeScoreEvents.length > 0 ? (
+                <div className="space-y-2 max-h-40 overflow-y-auto custom-scrollbar">
+                  {activeScoreEvents.map((scoreEvent, index) => (
+                    <div
+                      key={index}
+                      className="p-3 rounded-lg bg-zinc-800/50 border border-zinc-700 hover:border-zinc-600 transition"
+                    >
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-lg font-bold text-orange-400">
+                          {scoreEvent.score}
+                        </span>
+                        <span
+                          className="text-[10px] font-bold px-1.5 py-0.5 rounded"
+                          style={{
+                            color: "#f97316",
+                            backgroundColor: "#f9731615",
+                          }}
+                        >
+                          {(scoreEvent.confidence * 100).toFixed(0)}%
+                        </span>
+                      </div>
+                      <div className="text-sm text-zinc-300 mb-2">
+                        {scoreEvent.text}
+                      </div>
+                      {/* Confidence bar */}
+                      <div className="h-1 bg-zinc-800 rounded-full overflow-hidden">
+                        <div
+                          className="h-full rounded-full transition-all duration-300"
+                          style={{
+                            width: `${scoreEvent.confidence * 100}%`,
+                            backgroundColor: "#f97316",
+                          }}
+                        />
+                      </div>
+                      <div className="text-[10px] text-zinc-500 mt-1">
+                        {scoreEvent.start.toFixed(1)}s - {scoreEvent.end.toFixed(1)}s
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="flex flex-col items-center justify-center py-10 text-zinc-600">
+                  <svg width="32" height="32" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} className="mb-2">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                  </svg>
+                  <p className="text-xs">No score changes detected right now</p>
+                  <p className="text-[10px] text-zinc-700 mt-0.5">Play the video to see score data</p>
+                </div>
+              )}
+            </div>
+
             {/* Controls bar */}
             <div className="flex items-center justify-between flex-wrap gap-3">
               {/* Detection badges */}
@@ -761,6 +842,8 @@ export default function VideoTest() {
                     setAnalysisComplete(false);
                     setVideoUrl("");
                     setTimeline([]);
+                    setScoreEvents([]);
+                    setActiveScoreEvents([]);
                     setTrackedObjects([]);
                     setLiveStats({});
                   }}
