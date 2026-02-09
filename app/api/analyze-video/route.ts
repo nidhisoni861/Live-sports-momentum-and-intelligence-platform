@@ -15,6 +15,10 @@ import {
 } from "@/app/db/redis-models/live";
 import { normalizeToModels } from "@/app/db/models/normalizer";
 
+/* ================= ADDED NEO4J IMPORT (FIXED NAME) ================= */
+import { normalizeToNeo4jGraph } from "@/app/db/neo4j-models/neo-normalizer";
+/* =================================================================== */
+
 export const runtime = "nodejs";
 
 const MAX_SIZE_MB = 50;
@@ -41,10 +45,8 @@ function extractScore(text: string): string | null {
     .replace(/\s+/g, " ")
     .trim();
 
-  // ignore timestamps like 12:34
   if (/\b\d{1,2}:\d{2}\b/.test(s)) return null;
 
-  // match score patterns like "0-2" or "0 - 2"
   const m = s.match(/(\d{1,2})\s*[- ]\s*(\d{1,2})/);
   return m ? `${m[1]}-${m[2]}` : null;
 }
@@ -64,9 +66,8 @@ function getSegEnd(seg: any) {
   );
 }
 
-/* =========================================================
-   POST → Upload video → Google analysis → Mongo → Normalize
-   ========================================================= */
+/* ========================================================= */
+
 export async function POST(request: Request) {
   try {
     const formData = await request.formData();
@@ -81,7 +82,6 @@ export async function POST(request: Request) {
 
     validateFile(file);
 
-    // Portable credential path (relative to repo)
     const serviceAccountPath = join(
       process.cwd(),
       "app",
@@ -112,8 +112,6 @@ export async function POST(request: Request) {
     const [operationResult] = await operation.promise();
     const annotation = operationResult.annotationResults?.[0];
     if (!annotation) throw new Error("No annotation results returned");
-
-    /* ===== Normalize (simple) ===== */
 
     const labels = (annotation.segmentLabelAnnotations ?? []).map((l: any) => ({
       name: l.entity?.description ?? "",
@@ -174,7 +172,6 @@ export async function POST(request: Request) {
 
     const analyzedAt = new Date();
 
-    /* ========== Mongo upsert ========== */
     const mongoWrite = await saveVideoAnalysis({
       videoId: file.name,
       labels,
@@ -184,10 +181,8 @@ export async function POST(request: Request) {
       analyzedAt,
     });
 
-    // Always return a stable doc to frontend (prevents UI failures)
     const analysis = await getVideoAnalysisById(file.name);
 
-    /* ========== Populate other models (best-effort) ========== */
     try {
       await normalizeToModels({
         videoId: file.name,
@@ -201,7 +196,20 @@ export async function POST(request: Request) {
       console.warn("⚠ Normalization failed:", normErr);
     }
 
-    /* Redis optional init (best-effort) */
+    /* ================= ADDED NEO4J BLOCK (FIXED CALL) ================= */
+    try {
+      await normalizeToNeo4jGraph({
+        videoId: file.name,
+        objects,
+        scoreEvents,
+      });
+
+      console.log("✅ Neo4j graph written for", file.name);
+    } catch (neoErr) {
+      console.warn("⚠ Neo4j write failed:", neoErr);
+    }
+    /* ================================================================= */
+
     try {
       await buildLiveStateAtTime(file.name, 0);
     } catch (redisErr) {
@@ -216,7 +224,7 @@ export async function POST(request: Request) {
         matchedCount: mongoWrite.matchedCount ?? 0,
         modifiedCount: mongoWrite.modifiedCount ?? 0,
       },
-      analysis, // full stored doc (frontend can render immediately)
+      analysis,
       summary: {
         labelCount: labels.length,
         objectCount: objects.length,
@@ -226,61 +234,6 @@ export async function POST(request: Request) {
     });
   } catch (error: any) {
     console.error("❌ Video processing failed:", error);
-    return NextResponse.json(
-      { success: false, error: error?.message || "Failed" },
-      { status: 500 },
-    );
-  }
-}
-
-/* =========================================================
-   GET → Fetch stored analysis (Mongo) + live state (Redis)
-   Usage:
-   /api/analyze-video?videoId=football.mp4
-   /api/analyze-video?videoId=football.mp4&t=34
-   ========================================================= */
-export async function GET(request: Request) {
-  try {
-    const { searchParams } = new URL(request.url);
-    const videoId = searchParams.get("videoId");
-    const tParam = searchParams.get("t");
-    const t = tParam !== null ? Number(tParam) : null;
-
-    if (!videoId) {
-      return NextResponse.json(
-        { success: false, error: "videoId query param required" },
-        { status: 400 },
-      );
-    }
-
-    const analysis = await getVideoAnalysisById(videoId);
-
-    const live =
-      t !== null && Number.isFinite(t)
-        ? await getLiveStateAtTime(videoId, t)
-        : null;
-
-    if (!analysis && !live) {
-      return NextResponse.json(
-        { success: false, error: "No data found for videoId" },
-        { status: 404 },
-      );
-    }
-
-    return NextResponse.json({
-      success: true,
-      videoId,
-      analysis,
-      live,
-      summary: analysis ? {
-        labelCount: analysis.labels?.length || 0,
-        objectCount: analysis.objects?.length || 0,
-        textCount: analysis.text?.length || 0,
-        scoreEventCount: analysis.scoreEvents?.length || 0,
-      } : null,
-    });
-  } catch (error: any) {
-    console.error("❌ GET /api/analyze-video failed:", error);
     return NextResponse.json(
       { success: false, error: error?.message || "Failed" },
       { status: 500 },
