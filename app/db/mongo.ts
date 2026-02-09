@@ -42,14 +42,13 @@ async function ensureIndexes() {
   if (!global._mongoIndexesReady) {
     global._mongoIndexesReady = (async () => {
       const db = await getDb();
+      const col = db.collection("videoAnalysis");
 
-      // ✅ Professional: one doc per videoId
-      await db
-        .collection("videoAnalysis")
-        .createIndex({ videoId: 1 }, { unique: true });
+      // Regular index on videoId (uniqueness enforced by upsert logic)
+      await col.createIndex({ videoId: 1 });
 
-      // ✅ Helpful for sorting / browsing
-      await db.collection("videoAnalysis").createIndex({ createdAt: -1 });
+      // Helpful for sorting / browsing
+      await col.createIndex({ createdAt: -1 });
 
       console.log("🟢 [MONGO] Indexes ensured");
     })();
